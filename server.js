@@ -94,6 +94,106 @@ app.post('/generate-pdf', async (req, res) => {
     }
 });
 
+app.post('/extract-resume', async (req, res) => {
+
+    try {
+
+        const { text } = req.body;
+
+        if (!text) {
+
+            return res.status(400).json({
+                error: 'No text provided'
+            });
+        }
+
+        const prompt = `
+Extract the following resume into structured JSON.
+
+Return ONLY valid JSON.
+Do not return markdown.
+Do not return explanations.
+
+Schema:
+{
+  "fullName": "",
+  "title": "",
+  "email": "",
+  "phone": "",
+  "location": "",
+  "linkedIn": "",
+  "summary": "",
+  "skills": [],
+  "experiences": [
+    {
+      "company": "",
+      "title": "",
+      "startDate": "",
+      "endDate": "",
+      "bullets": []
+    }
+  ],
+  "education": [
+    {
+      "degree": "",
+      "school": "",
+      "years": ""
+    }
+  ],
+  "certifications": []
+}
+
+Resume:
+${text}
+`;
+
+        const completion =
+            await openai.chat.completions.create({
+
+                model: 'gpt-4.1-mini',
+
+                messages: [
+                    {
+                        role: 'system',
+                        content:
+                            'You are a resume parsing engine that extracts structured resume information.'
+                    },
+                    {
+                        role: 'user',
+                        content: prompt
+                    }
+                ],
+
+                temperature: 0.2
+            });
+
+        const aiText =
+            completion.choices[0]
+                .message.content;
+
+        console.log(
+            'AI RESPONSE:',
+            aiText
+        );
+
+        const parsed =
+            JSON.parse(aiText);
+
+        res.json(parsed);
+
+    } catch (e) {
+
+        console.error(
+            'AI EXTRACTION ERROR:',
+            e
+        );
+
+        res.status(500).json({
+            error: 'AI extraction failed'
+        });
+    }
+});
+
 const PORT =
     process.env.PORT || 3000;
 
