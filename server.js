@@ -24,47 +24,66 @@ app.post('/generate-pdf', async (req, res) => {
             css
         } = req.body;
 
-       const browser =
-    await puppeteer.launch({
+        const browser =
+            await puppeteer.launch({
+                headless: true,
+                args: [
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox'
+                ]
+            });
 
-        headless: true,
-
-        args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-gpu'
-        ]
-    });
-    
         const page =
             await browser.newPage();
-            
-            await page.setViewport({
-    width: 1400,
-    height: 2000,
-    deviceScaleFactor: 2
-});
 
+        await page.setViewport({
+            width: 1400,
+            height: 2000,
+            deviceScaleFactor: 2
+        });
 
-        const finalHtml = `
-            <html>
-                <head>
-                    <style>
-                        ${css}
-                    </style>
-                </head>
+        const fullHtml = `
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
 
-                <body>
-                    ${html}
-                </body>
-            </html>
-        `;
+    <style>
 
-        await page.setContent(html, {
-    waitUntil: 'networkidle0'
-});
-await page.emulateMediaType('screen');
+        ${css}
+
+        body {
+            margin: 0;
+            padding: 20px;
+            background: #ffffff;
+            font-family: Arial, sans-serif;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+    </style>
+</head>
+
+<body>
+
+    ${html}
+
+</body>
+</html>
+`;
+
+        await page.setContent(
+            fullHtml,
+            {
+                waitUntil: 'networkidle0'
+            }
+        );
+
+        await page.emulateMediaType(
+            'screen'
+        );
 
         const pdf =
             await page.pdf({
@@ -90,13 +109,13 @@ await page.emulateMediaType('screen');
     } catch (e) {
 
         console.error(
-        'PDF generation error:',
-        e
-    );
+            'PDF generation error:',
+            e
+        );
 
-    res.status(500).send({
-        error: e.message
-    });
+        res.status(500).send(
+            'PDF generation failed'
+        );
     }
 });
 
