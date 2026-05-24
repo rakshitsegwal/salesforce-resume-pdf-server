@@ -36,8 +36,16 @@ app.post('/generate-pdf', async (req, res) => {
             '--disable-gpu'
         ]
     });
+    
         const page =
             await browser.newPage();
+            
+            await page.setViewport({
+    width: 1400,
+    height: 2000,
+    deviceScaleFactor: 2
+});
+
 
         const finalHtml = `
             <html>
@@ -53,12 +61,10 @@ app.post('/generate-pdf', async (req, res) => {
             </html>
         `;
 
-        await page.setContent(
-            finalHtml,
-            {
-                waitUntil: 'networkidle0'
-            }
-        );
+        await page.setContent(html, {
+    waitUntil: 'networkidle0'
+});
+await page.emulateMediaType('screen');
 
         const pdf =
             await page.pdf({
