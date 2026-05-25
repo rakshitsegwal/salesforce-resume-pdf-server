@@ -16,11 +16,21 @@ app.use(express.json({
 }));
 
 // =============================================================================
+// VERSION MARKER — used to verify which build is actually live on Railway.
+// =============================================================================
+const SERVER_VERSION = 'v3-with-overrides-2026-05-25';
+const BOOT_TIME = Date.now();
+
+app.get('/version', (req, res) => {
+    res.json({
+        version: SERVER_VERSION,
+        bootTime: new Date(BOOT_TIME).toISOString(),
+        nowTime: new Date().toISOString()
+    });
+});
+
+// =============================================================================
 // PDF OVERRIDE CSS
-// -----------------------------------------------------------------------------
-// Appended AFTER the client CSS so it wins on specificity.
-// Neutralizes preview-only styling (scale transform, card shadow, etc.) and
-// enforces A4-correct dimensions so the resume renders at full size.
 // =============================================================================
 const PDF_OVERRIDE_CSS = `
 
@@ -47,20 +57,18 @@ html, body {
         sans-serif;
 }
 
-/* ---- Force backgrounds / gradients to render in print ---- */
 * {
     -webkit-print-color-adjust: exact !important;
     print-color-adjust: exact !important;
 }
 
-/* ---- Kill preview-only transforms / shadows / rounding on .rb-resume ---- */
 .rb-resume {
     transform: none !important;
     transform-origin: top left !important;
     border-radius: 0 !important;
     box-shadow: none !important;
     max-width: none !important;
-    width: 794px !important;       /* A4 width at 96dpi */
+    width: 794px !important;
     margin: 0 auto !important;
     overflow: visible !important;
     background: #ffffff !important;
@@ -70,7 +78,6 @@ html, body {
     transform: none !important;
 }
 
-/* ---- Avoid awkward page breaks inside content blocks ---- */
 .rb-resume__header,
 .rb-resume__exp,
 .rb-resume__edu,
@@ -80,7 +87,6 @@ html, body {
     page-break-inside: avoid;
 }
 
-/* ---- The photo placeholder gradient needs explicit print color flag ---- */
 .rb-resume__photo-placeholder,
 .rb-resume__top-deco,
 .rb-resume__cert {
@@ -90,6 +96,13 @@ html, body {
 `;
 
 app.post('/generate-pdf', async (req, res) => {
+
+    // Diagnostic log — visible in Railway → Deployments → Logs
+    console.log('[' + SERVER_VERSION + '] /generate-pdf hit at', new Date().toISOString(), {
+        htmlLength: req.body?.html?.length,
+        cssLength: req.body?.css?.length,
+        cssFirst80: req.body?.css?.slice(0, 80)
+    });
 
     try {
 
@@ -109,8 +122,6 @@ app.post('/generate-pdf', async (req, res) => {
 
         const page = await browser.newPage();
 
-        // A4 at 96dpi = 794 x 1123 px.
-        // deviceScaleFactor=2 gives crisp text without changing the layout box.
         await page.setViewport({
             width: 794,
             height: 1123,
@@ -122,10 +133,11 @@ app.post('/generate-pdf', async (req, res) => {
 <html>
 <head>
     <meta charset="UTF-8">
+    <meta name="server-version" content="${SERVER_VERSION}">
 
     <style>
         /* ===== Client CSS (from the live LWC) ===== */
-        ${css}
+        ${css || ''}
 
         /* ===== PDF Overrides (must come last) ===== */
         ${PDF_OVERRIDE_CSS}
@@ -133,7 +145,7 @@ app.post('/generate-pdf', async (req, res) => {
 </head>
 
 <body>
-    ${html}
+    ${html || ''}
 </body>
 </html>
 `;
@@ -145,12 +157,8 @@ app.post('/generate-pdf', async (req, res) => {
             }
         );
 
-        // Use screen media so the resume keeps its on-screen look,
-        // but printBackground + the color-adjust CSS rules above
-        // ensure gradients and tinted backgrounds still render.
         await page.emulateMediaType('screen');
 
-        // Give fonts and any inline base64 images a beat to settle.
         await page.evaluateHandle('document.fonts.ready');
 
         const pdf = await page.pdf({
@@ -169,7 +177,8 @@ app.post('/generate-pdf', async (req, res) => {
 
         res.set({
             'Content-Type': 'application/pdf',
-            'Content-Length': pdf.length
+            'Content-Length': pdf.length,
+            'X-Server-Version': SERVER_VERSION
         });
 
         res.send(pdf);
@@ -194,7 +203,6 @@ app.post('/extract-resume', async (req, res) => {
         const { text } = req.body;
 
         if (!text) {
-
             return res.status(400).json({
                 error: 'No text provided'
             });
@@ -241,21 +249,17 @@ ${text}
 `;
 
         const completion = await openai.chat.completions.create({
-
             model: 'gpt-4.1-mini',
-
             messages: [
                 {
                     role: 'system',
-                    content:
-                        'You are a resume parsing engine that extracts structured resume information.'
+                    content: 'You are a resume parsing engine that extracts structured resume information.'
                 },
                 {
                     role: 'user',
                     content: prompt
                 }
             ],
-
             temperature: 0.2
         });
 
@@ -268,12 +272,7 @@ ${text}
         res.json(parsed);
 
     } catch (e) {
-
-        console.error(
-            'AI EXTRACTION ERROR:',
-            e
-        );
-
+        console.error('AI EXTRACTION ERROR:', e);
         res.status(500).json({
             error: 'AI extraction failed'
         });
@@ -283,5 +282,5 @@ ${text}
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-    console.log(`PDF server running on ${PORT}`);
+    console.log(`PDF server ${SERVER_VERSION} running on ${PORT}`);
 });
