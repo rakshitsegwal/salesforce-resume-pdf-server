@@ -286,8 +286,10 @@ app.post(
         try {
 
             const {
-                prompt
-            } = req.body;
+    prompt,
+    resumeData,
+    metadata
+} = req.body;
 
             const completion =
                 await openai.chat.completions.create({
@@ -322,10 +324,35 @@ RULES:
                         },
 
                         {
-                            role: 'user',
+    role: 'user',
 
-                            content: prompt
-                        }
+    content: `
+
+USER DESIGN REQUEST:
+${prompt}
+
+RESUME DATA:
+${JSON.stringify(resumeData)}
+
+RESUME METADATA:
+${JSON.stringify(metadata)}
+
+Generate CSS optimized specifically for THIS resume.
+
+Requirements:
+- Single page layout
+- ATS friendly
+- Compact if resume has large content
+- Elegant spacing if content is small
+- Modern SaaS quality design
+- Professional typography
+- Prevent overflow
+- Prevent clipping
+- No absolute positioning
+- No fixed positioning
+- Only generate CSS
+`
+}
                     ],
 
                     temperature: 0.9
