@@ -279,6 +279,80 @@ ${text}
     }
 });
 
+app.post(
+    '/generate-template',
+    async (req, res) => {
+
+        try {
+
+            const {
+                prompt
+            } = req.body;
+
+            const completion =
+                await openai.chat.completions.create({
+
+                    model: 'gpt-4.1-mini',
+
+                    messages: [
+
+                        {
+                            role: 'system',
+
+                            content: `
+You are an elite resume template designer.
+
+You ONLY generate CSS.
+
+RULES:
+- Output CSS ONLY
+- No markdown
+- No explanations
+- Use only:
+  .rb-resume--ai-generated
+- Keep ATS friendly
+- Keep single-page optimized
+- Modern SaaS aesthetic
+- No animations
+- No absolute positioning
+- No fixed positioning
+- No broken layouts
+- No JavaScript
+`
+                        },
+
+                        {
+                            role: 'user',
+
+                            content: prompt
+                        }
+                    ],
+
+                    temperature: 0.9
+                });
+
+            const css =
+                completion
+                    .choices[0]
+                    .message
+                    .content;
+
+            res.json({
+                css
+            });
+
+        } catch (e) {
+
+            console.error(e);
+
+            res.status(500).json({
+                error:
+                    'Template generation failed'
+            });
+        }
+    }
+);
+
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
