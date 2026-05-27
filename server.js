@@ -1,3 +1,5 @@
+import rateLimit from 'express-rate-limit';
+import helmet from 'helmet';
 const OpenAI = require('openai');
 const express = require('express');
 const cors = require('cors');
@@ -5,14 +7,70 @@ const puppeteer = require('puppeteer');
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const app = express();
+app.set('trust proxy', 1);
 
-app.use(cors());
-app.use(express.json({ limit: '20mb' }));
+app.use(cors({
+    origin: [
+        'https://developwithrax-dev-ed.my.site.com'
+    ],
+    methods: [
+        'GET',
+        'POST'
+    ],
+    allowedHeaders: [
+        'Content-Type',
+        'x-client-id'
+    ]
+}));
+app.use(express.json({ limit: '1mb' }));
+app.use(
+    helmet({
+        crossOriginEmbedderPolicy: false,
+        contentSecurityPolicy: false
+    })
+);
 
 // ─── Version marker ───────────────────────────────────────────────────────────
 const SERVER_VERSION = 'v4-redesign-2026-05-27';
 const BOOT_TIME = Date.now();
 
+const aiLimiter = rateLimit({
+
+    windowMs: 15 * 60 * 1000,
+
+    max: 20,
+
+    standardHeaders: true,
+
+    legacyHeaders: false,
+
+    message: {
+        error:
+            'Too many AI requests. Please try again later.'
+    }
+});
+
+const exportLimiter = rateLimit({
+
+    windowMs: 60 * 60 * 1000,
+
+    max: 5,
+
+    message: {
+        error:
+            'PDF export limit reached. Please try later.'
+    }
+});
+app.use('/generate-template', aiLimiter);
+app.use('/extract-resume', aiLimiter);
+app.use('/review-resume', aiLimiter);
+app.use('/improve-summary', aiLimiter);
+app.use('/generate-pdf', exportLimiter);
+app.use('/generate-template', validateClientSession);
+app.use('/extract-resume', validateClientSession);
+app.use('/review-resume', validateClientSession);
+app.use('/improve-summary', validateClientSession);
+app.use('/generate-pdf', validateClientSession);
 app.get('/version', (req, res) => {
     res.json({
         version: SERVER_VERSION,
@@ -20,6 +78,38 @@ app.get('/version', (req, res) => {
         nowTime:  new Date().toISOString()
     });
 });
+
+function validateClientSession(req, res, next) {
+
+    const clientId =
+        req.headers['x-client-id'];
+
+    if (!clientId) {
+        return res.status(400).json({
+            error:
+                'Missing client session.'
+        });
+    }
+
+    if (clientId.length > 100) {
+        return res.status(400).json({
+            error:
+                'Invalid client session.'
+        });
+    }
+
+    next();
+}
+
+function truncateText(text, max = 12000) {
+
+    if (!text) {
+        return '';
+    }
+
+    return String(text)
+        .slice(0, max);
+}
 
 // ─── PDF override CSS (applied last so Puppeteer renders cleanly) ─────────────
 const PDF_OVERRIDE_CSS = `
@@ -153,7 +243,9 @@ app.post('/generate-pdf', async (req, res) => {
 app.post('/extract-resume', async (req, res) => {
 
     try {
-        const { text } = req.body;
+        let { text } = req.body;
+
+text = truncateText(text, 12000);
         if (!text) return res.status(400).json({ error: 'No text provided' });
 
         const prompt = `You are an expert resume parser. Extract structured data from the resume text below.
@@ -350,6 +442,13 @@ Generate CSS that:
     }
 });
 
+function sanitizeInput(value) {
+
+    return String(value || '')
+        .replace(/<script.*?>.*?<\/script>/gi, '')
+        .trim();
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // POST /improve-summary
 // Rewrites the user's professional summary using their full resume context
@@ -479,4 +578,14 @@ const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
     console.log(`[${SERVER_VERSION}] Server running on port ${PORT}`);
+});
+
+app.use((err, req, res, next) => {
+
+    console.error(err);
+
+    res.status(500).json({
+        error:
+            'Something went wrong.'
+    });
 });
