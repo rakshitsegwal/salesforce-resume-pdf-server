@@ -1,5 +1,5 @@
-import rateLimit from 'express-rate-limit';
-import helmet from 'helmet';
+const rateLimit = require('express-rate-limit');
+const helmet = require('helmet');
 const OpenAI = require('openai');
 const express = require('express');
 const cors = require('cors');
