@@ -148,6 +148,7 @@ app.post('/generate-pdf', async (req, res) => {
 // ═════════════════════════════════════════════════════════════════════════════
 // POST /extract-resume
 // Parses raw resume text into structured JSON
+// Handles two-column PDFs, dense content, and bullet trimming for single-page
 // ═════════════════════════════════════════════════════════════════════════════
 app.post('/extract-resume', async (req, res) => {
 
@@ -155,39 +156,48 @@ app.post('/extract-resume', async (req, res) => {
         const { text } = req.body;
         if (!text) return res.status(400).json({ error: 'No text provided' });
 
-        const prompt = `Extract the following resume into structured JSON.
+        const prompt = `You are an expert resume parser. Extract structured data from the resume text below.
 
-Return ONLY valid JSON with no markdown, no code fences, no explanations.
+IMPORTANT — Two-column PDF note: The text may be extracted from a two-column PDF layout where sidebar content (skills, certifications, summary) is interleaved with main content (experience, education). Intelligently identify and separate these sections regardless of their order in the raw text.
+
+Return ONLY valid JSON. No markdown, no code fences, no explanations.
 
 Schema:
 {
-  "fullName": "",
-  "title": "",
-  "email": "",
-  "phone": "",
-  "location": "",
-  "linkedIn": "",
-  "summary": "",
-  "skills": [],
+  "fullName": "string",
+  "title": "string — job title/headline only, not a sentence",
+  "email": "string",
+  "phone": "string",
+  "location": "string — city/country only",
+  "linkedIn": "string — full URL or path",
+  "summary": "string — 2-4 sentence professional summary, rewrite from About section if present",
+  "skills": ["array of individual skill strings, max 20"],
   "experiences": [
     {
-      "company": "",
-      "title": "",
-      "startDate": "",
-      "endDate": "",
-      "bullets": []
+      "company": "string",
+      "title": "string",
+      "startDate": "string e.g. Jan 2021",
+      "endDate": "string e.g. Present",
+      "bullets": ["MAXIMUM 4 bullet points per role — pick the 4 most impactful, quantified achievements. Rewrite each to start with a strong action verb. Each bullet max 120 characters."]
     }
   ],
   "education": [
     {
-      "degree": "",
-      "field": "",
-      "school": "",
-      "years": ""
+      "degree": "string e.g. Bachelor of Technology",
+      "field": "string e.g. Computer Science",
+      "school": "string",
+      "years": "string e.g. 2014 – 2018"
     }
   ],
-  "certifications": []
+  "certifications": ["array of certification name strings only, max 8"]
 }
+
+CRITICAL RULES:
+1. MAX 4 bullets per experience role — choose the most impactful ones with numbers/results
+2. MAX 20 skills — pick the most relevant technical skills
+3. Ignore repeated or similar bullets — deduplicate
+4. Skills, certifications, and summary often appear in a sidebar — extract them correctly even if interleaved with experience text
+5. Do NOT include generic bullets like "Roles and responsibilities include..." or "Continue to bridge the gap..."
 
 Resume text:
 ${text}`;
@@ -197,7 +207,7 @@ ${text}`;
             messages:    [
                 {
                     role:    'system',
-                    content: 'You are a resume parsing engine. Extract structured data from resume text. Return ONLY valid JSON matching the requested schema.'
+                    content: 'You are an expert resume parser. Extract clean structured data. Return ONLY valid JSON.'
                 },
                 { role: 'user', content: prompt }
             ],
@@ -206,6 +216,17 @@ ${text}`;
         });
 
         const parsed = JSON.parse(completion.choices[0].message.content);
+
+        // Server-side enforcement: cap bullets and skills even if AI ignored the limit
+        if (parsed.experiences) {
+            parsed.experiences = parsed.experiences.map(exp => ({
+                ...exp,
+                bullets: (exp.bullets || []).slice(0, 4)
+            }));
+        }
+        if (parsed.skills)         parsed.skills         = parsed.skills.slice(0, 20);
+        if (parsed.certifications) parsed.certifications = parsed.certifications.slice(0, 8);
+
         res.json(parsed);
 
     } catch (e) {
@@ -272,21 +293,34 @@ CSS selectors available to style:
 .rb-resume--ai-generated .rb-edu-years
 .rb-resume--ai-generated .rb-edu-school`;
 
-        const userPrompt = `USER DESIGN REQUEST:
+const userPrompt = `USER DESIGN REQUEST:
 ${prompt}
 
 RESUME CONTENT METADATA:
 - Has photo: ${metadata?.hasPhoto || false}
-- Experiences: ${metadata?.experienceCount || 0}
+- Experience entries: ${metadata?.experienceCount || 0}
 - Skills: ${metadata?.skillCount || 0}
 - Certifications: ${metadata?.certificationCount || 0}
 - Education entries: ${metadata?.educationCount || 0}
 - Summary length: ${metadata?.summaryLength || 0} characters
+- Total bullet points across all roles: ${metadata?.totalBullets || 0}
+- Content density: ${metadata?.totalBullets > 12 || metadata?.experienceCount > 3 ? 'HIGH — use compact spacing' : 'NORMAL'}
+
+${metadata?.totalBullets > 12 || metadata?.experienceCount > 3 ? `
+DENSITY WARNING: This resume has ${metadata?.totalBullets || 'many'} bullet points across ${metadata?.experienceCount || 'multiple'} roles.
+You MUST use compact CSS to fit it on one page:
+- .rb-resume font-size: 8.5px (not 10px)
+- .rb-resume__body padding: 0
+- .rb-resume__section margin-bottom: 10px (not 18px)
+- .rb-exp-item margin-bottom: 8px (not 13px)
+- .rb-exp-bullets li padding/margin: 1px
+- .rb-resume__header padding: 16px 24px 12px
+` : ''}
 
 Generate CSS that:
 1. Matches the design intent from the user request
-2. Is optimised for the content density above
-3. Is single-page ATS-friendly
+2. Is specifically optimised for the content density above
+3. Keeps everything on ONE A4 page — this is critical
 4. Uses ONLY the .rb-resume--ai-generated namespace
 5. Returns ONLY raw CSS — nothing else`;
 
