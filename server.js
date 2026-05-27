@@ -302,24 +302,33 @@ app.post(
                             role: 'system',
 
                             content: `
-You are an elite resume template designer.
+YYou are an elite AI resume designer.
 
 You ONLY generate CSS.
 
-RULES:
-- Output CSS ONLY
-- No markdown
-- No explanations
-- Use only:
-  .rb-resume--ai-generated
-- Keep ATS friendly
-- Keep single-page optimized
-- Modern SaaS aesthetic
-- No animations
+You are designing modern premium resumes.
+
+Requirements:
+- ATS friendly
+- One-page optimized
+- Minimal modern aesthetic
+- Elegant typography
+- Compact spacing when content is dense
+- Spacious layout when content is small
+- SaaS-level visual quality
+- Professional hierarchy
+- Beautiful PDF rendering
+- Never overflow
+- Never clip
 - No absolute positioning
 - No fixed positioning
-- No broken layouts
-- No JavaScript
+- No animations
+- Use ONLY:
+  .rb-resume--ai-generated
+
+Output ONLY raw CSS.
+No markdown.
+No explanations.
 `
                         },
 
