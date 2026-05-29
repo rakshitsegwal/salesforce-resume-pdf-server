@@ -1,28 +1,24 @@
 const rateLimit = require('express-rate-limit');
-const helmet = require('helmet');
-const OpenAI = require('openai');
-const express = require('express');
-const cors = require('cors');
+const helmet    = require('helmet');
+const OpenAI    = require('openai');
+const express   = require('express');
+const cors      = require('cors');
 const puppeteer = require('puppeteer');
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-const app = express();
+const app    = express();
 app.set('trust proxy', 1);
 
 app.use(cors({
     origin: [
         'https://developwithrax-dev-ed.my.site.com'
     ],
-    methods: [
-        'GET',
-        'POST'
-    ],
-    allowedHeaders: [
-        'Content-Type',
-        'x-client-id'
-    ]
+    methods: ['GET', 'POST'],
+    allowedHeaders: ['Content-Type', 'x-client-id']
 }));
-app.use(express.json({ limit: '10mb' }));
+
+app.use(express.json({ limit: '20mb' }));   // Increased for base64 inspiration images
+
 app.use(
     helmet({
         crossOriginEmbedderPolicy: false,
@@ -31,87 +27,66 @@ app.use(
 );
 
 // ─── Version marker ───────────────────────────────────────────────────────────
-const SERVER_VERSION = 'v4-redesign-2026-05-27';
-const BOOT_TIME = Date.now();
+const SERVER_VERSION = 'v5-ai-flow-gallery-2026';
+const BOOT_TIME      = Date.now();
 
+// ─── Rate limiters ────────────────────────────────────────────────────────────
 const aiLimiter = rateLimit({
-
     windowMs: 15 * 60 * 1000,
-
     max: 20,
-
     standardHeaders: true,
-
     legacyHeaders: false,
-
-    message: {
-        error:
-            'Too many AI requests. Please try again later.'
-    }
+    message: { error: 'Too many AI requests. Please try again later.' }
 });
 
 const exportLimiter = rateLimit({
-
     windowMs: 60 * 60 * 1000,
-
     max: 5,
-
-    message: {
-        error:
-            'PDF export limit reached. Please try later.'
-    }
+    message: { error: 'PDF export limit reached. Please try later.' }
 });
-app.use('/generate-template', aiLimiter);
-app.use('/extract-resume', aiLimiter);
-app.use('/review-resume', aiLimiter);
-app.use('/improve-summary', aiLimiter);
-app.use('/generate-pdf', exportLimiter);
-app.use('/generate-template', validateClientSession);
-app.use('/extract-resume', validateClientSession);
-app.use('/review-resume', validateClientSession);
-app.use('/improve-summary', validateClientSession);
-app.use('/generate-pdf', validateClientSession);
+
+app.use('/generate-template',       aiLimiter);
+app.use('/extract-resume',          aiLimiter);
+app.use('/review-resume',           aiLimiter);
+app.use('/improve-summary',         aiLimiter);
+app.use('/generate-pdf',            exportLimiter);
+
+app.use('/generate-template',       validateClientSession);
+app.use('/extract-resume',          validateClientSession);
+app.use('/review-resume',           validateClientSession);
+app.use('/improve-summary',         validateClientSession);
+app.use('/generate-pdf',            validateClientSession);
+
+// ─── Health / version ─────────────────────────────────────────────────────────
 app.get('/version', (req, res) => {
     res.json({
-        version: SERVER_VERSION,
+        version:  SERVER_VERSION,
         bootTime: new Date(BOOT_TIME).toISOString(),
         nowTime:  new Date().toISOString()
     });
 });
 
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
 function validateClientSession(req, res, next) {
-
-    const clientId =
-        req.headers['x-client-id'];
-
-    if (!clientId) {
-        return res.status(400).json({
-            error:
-                'Missing client session.'
-        });
-    }
-
-    if (clientId.length > 100) {
-        return res.status(400).json({
-            error:
-                'Invalid client session.'
-        });
-    }
-
+    const clientId = req.headers['x-client-id'];
+    if (!clientId)           return res.status(400).json({ error: 'Missing client session.' });
+    if (clientId.length > 100) return res.status(400).json({ error: 'Invalid client session.' });
     next();
 }
 
 function truncateText(text, max = 12000) {
-
-    if (!text) {
-        return '';
-    }
-
-    return String(text)
-        .slice(0, max);
+    if (!text) return '';
+    return String(text).slice(0, max);
 }
 
-// ─── PDF override CSS (applied last so Puppeteer renders cleanly) ─────────────
+function sanitizeInput(value) {
+    return String(value || '')
+        .replace(/<script.*?>.*?<\/script>/gi, '')
+        .trim();
+}
+
+// ─── PDF override CSS ─────────────────────────────────────────────────────────
 const PDF_OVERRIDE_CSS = `
 @page { size: A4; margin: 0; }
 
@@ -121,7 +96,6 @@ html, body {
     background: #ffffff !important;
     -webkit-print-color-adjust: exact !important;
     print-color-adjust: exact !important;
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
 }
 
 * {
@@ -152,7 +126,6 @@ html, body {
     page-break-inside: avoid;
 }
 
-/* Remove preview scaling — Puppeteer renders at full size */
 .rp-preview__scale-wrap {
     transform: none !important;
     margin-bottom: 0 !important;
@@ -189,7 +162,6 @@ app.post('/generate-pdf', async (req, res) => {
         });
 
         const page = await browser.newPage();
-
         await page.setViewport({ width: 794, height: 1123, deviceScaleFactor: 2 });
 
         const fullHtml = `<!DOCTYPE html>
@@ -223,9 +195,9 @@ app.post('/generate-pdf', async (req, res) => {
         await browser.close();
 
         res.set({
-            'Content-Type':     'application/pdf',
-            'Content-Length':    pdf.length,
-            'X-Server-Version':  SERVER_VERSION
+            'Content-Type':    'application/pdf',
+            'Content-Length':   pdf.length,
+            'X-Server-Version': SERVER_VERSION
         });
         res.send(pdf);
 
@@ -237,15 +209,12 @@ app.post('/generate-pdf', async (req, res) => {
 
 // ═════════════════════════════════════════════════════════════════════════════
 // POST /extract-resume
-// Parses raw resume text into structured JSON
-// Handles two-column PDFs, dense content, and bullet trimming for single-page
 // ═════════════════════════════════════════════════════════════════════════════
 app.post('/extract-resume', async (req, res) => {
 
     try {
         let { text } = req.body;
-
-text = truncateText(text, 12000);
+        text = truncateText(text, 12000);
         if (!text) return res.status(400).json({ error: 'No text provided' });
 
         const prompt = `You are an expert resume parser. Extract structured data from the resume text below.
@@ -295,21 +264,18 @@ Resume text:
 ${text}`;
 
         const completion = await openai.chat.completions.create({
-            model:       'gpt-4.1-mini',
-            messages:    [
-                {
-                    role:    'system',
-                    content: 'You are an expert resume parser. Extract clean structured data. Return ONLY valid JSON.'
-                },
-                { role: 'user', content: prompt }
+            model:           'gpt-4.1-mini',
+            messages:        [
+                { role: 'system', content: 'You are an expert resume parser. Extract clean structured data. Return ONLY valid JSON.' },
+                { role: 'user',   content: prompt }
             ],
-            temperature: 0.1,
+            temperature:     0.1,
             response_format: { type: 'json_object' }
         });
 
         const parsed = JSON.parse(completion.choices[0].message.content);
 
-        // Server-side enforcement: cap bullets and skills even if AI ignored the limit
+        // Server-side enforcement: cap bullets and skills
         if (parsed.experiences) {
             parsed.experiences = parsed.experiences.map(exp => ({
                 ...exp,
@@ -329,13 +295,75 @@ ${text}`;
 
 // ═════════════════════════════════════════════════════════════════════════════
 // POST /generate-template
-// Generates AI CSS for the resume based on a user prompt
+// Generates AI CSS — now supports optional inspiration image via base64
 // ═════════════════════════════════════════════════════════════════════════════
 app.post('/generate-template', async (req, res) => {
 
     try {
-        const { prompt, resumeData, metadata } = req.body;
+        const {
+            prompt,
+            resumeData,
+            metadata,
+            inspirationBase64,
+            inspirationMimeType
+        } = req.body;
 
+        const hasInspiration = !!(
+            inspirationBase64 &&
+            inspirationMimeType &&
+            (inspirationMimeType.startsWith('image/') || inspirationMimeType === 'application/pdf') &&
+            inspirationBase64.length < 4 * 1024 * 1024  // 4MB base64 limit
+        );
+
+        // ── Step 1: If inspiration image provided, vision-analyse it first ──
+        let inspirationStyleSignals = '';
+
+        if (hasInspiration) {
+            try {
+                console.log(`[${SERVER_VERSION}] Analysing inspiration image (${inspirationMimeType})`);
+
+                const visionCompletion = await openai.chat.completions.create({
+                    model: 'gpt-4o',
+                    messages: [
+                        {
+                            role: 'system',
+                            content: `You are a design analyst specialising in resume aesthetics and typography.
+Analyse the uploaded resume image and extract ONLY style/design signals.
+DO NOT extract or mention any personal data, names, companies, or content.
+Focus exclusively on: layout structure, colour palette, typography choices, spacing density, section divider styles, header treatment, sidebar vs single-column, font character (serif/sans), visual hierarchy signals.
+Return your analysis as a compact, structured paragraph of CSS-relevant design signals only.`
+                        },
+                        {
+                            role: 'user',
+                            content: [
+                                {
+                                    type: 'image_url',
+                                    image_url: {
+                                        url:    `data:${inspirationMimeType};base64,${inspirationBase64}`,
+                                        detail: 'low'   // Low detail sufficient for style extraction
+                                    }
+                                },
+                                {
+                                    type: 'text',
+                                    text: 'Analyse this resume image for design and style signals only. Extract: colour palette, typography style (serif/sans/mono), layout structure (columns, spacing), header style, section dividers, overall visual density. Return only design signals, no personal data.'
+                                }
+                            ]
+                        }
+                    ],
+                    max_tokens: 300,
+                    temperature: 0.3
+                });
+
+                inspirationStyleSignals = visionCompletion.choices[0].message.content.trim();
+                console.log(`[${SERVER_VERSION}] Inspiration signals extracted:`, inspirationStyleSignals.slice(0, 100));
+
+            } catch (visionErr) {
+                // Non-fatal — proceed without inspiration signals
+                console.warn(`[${SERVER_VERSION}] Vision analysis failed (non-fatal):`, visionErr.message);
+            }
+        }
+
+        // ── Step 2: Generate CSS template ──
         const systemPrompt = `You are an elite AI resume designer. You ONLY generate CSS.
 
 You design modern, premium, ATS-friendly resumes.
@@ -385,8 +413,25 @@ CSS selectors available to style:
 .rb-resume--ai-generated .rb-edu-years
 .rb-resume--ai-generated .rb-edu-school`;
 
-const userPrompt = `USER DESIGN REQUEST:
-${prompt}
+        const densityWarning = (metadata?.totalBullets > 12 || metadata?.experienceCount > 3)
+            ? `\nDENSITY WARNING: This resume has ${metadata?.totalBullets || 'many'} bullet points across ${metadata?.experienceCount || 'multiple'} roles.
+You MUST use compact CSS to fit it on one page:
+- .rb-resume--ai-generated font-size: 8.5px
+- .rb-resume--ai-generated .rb-resume__body padding: 0
+- .rb-resume--ai-generated .rb-resume__section margin-bottom: 10px
+- .rb-resume--ai-generated .rb-exp-item margin-bottom: 8px
+- .rb-resume--ai-generated .rb-exp-bullets li padding/margin: 1px
+- .rb-resume--ai-generated .rb-resume__header padding: 16px 24px 12px`
+            : '';
+
+        const inspirationBlock = inspirationStyleSignals
+            ? `\nSTYLE INSPIRATION SIGNALS (extracted from uploaded reference — translate these into equivalent CSS):
+${inspirationStyleSignals}`
+            : '';
+
+        const userPrompt = `USER DESIGN REQUEST:
+${sanitizeInput(prompt)}
+${inspirationBlock}
 
 RESUME CONTENT METADATA:
 - Has photo: ${metadata?.hasPhoto || false}
@@ -397,24 +442,15 @@ RESUME CONTENT METADATA:
 - Summary length: ${metadata?.summaryLength || 0} characters
 - Total bullet points across all roles: ${metadata?.totalBullets || 0}
 - Content density: ${metadata?.totalBullets > 12 || metadata?.experienceCount > 3 ? 'HIGH — use compact spacing' : 'NORMAL'}
-
-${metadata?.totalBullets > 12 || metadata?.experienceCount > 3 ? `
-DENSITY WARNING: This resume has ${metadata?.totalBullets || 'many'} bullet points across ${metadata?.experienceCount || 'multiple'} roles.
-You MUST use compact CSS to fit it on one page:
-- .rb-resume font-size: 8.5px (not 10px)
-- .rb-resume__body padding: 0
-- .rb-resume__section margin-bottom: 10px (not 18px)
-- .rb-exp-item margin-bottom: 8px (not 13px)
-- .rb-exp-bullets li padding/margin: 1px
-- .rb-resume__header padding: 16px 24px 12px
-` : ''}
+${densityWarning}
 
 Generate CSS that:
 1. Matches the design intent from the user request
-2. Is specifically optimised for the content density above
-3. Keeps everything on ONE A4 page — this is critical
-4. Uses ONLY the .rb-resume--ai-generated namespace
-5. Returns ONLY raw CSS — nothing else`;
+${inspirationStyleSignals ? '2. Incorporates the style signals from the inspiration image — translate their visual language into equivalent CSS for the rb-resume structure' : '2. Creates a distinctive, premium design'}
+3. Is specifically optimised for the content density above
+4. Keeps everything on ONE A4 page — this is critical
+5. Uses ONLY the .rb-resume--ai-generated namespace
+6. Returns ONLY raw CSS — nothing else`;
 
         const completion = await openai.chat.completions.create({
             model:       'gpt-4.1-mini',
@@ -442,23 +478,14 @@ Generate CSS that:
     }
 });
 
-function sanitizeInput(value) {
-
-    return String(value || '')
-        .replace(/<script.*?>.*?<\/script>/gi, '')
-        .trim();
-}
-
 // ═════════════════════════════════════════════════════════════════════════════
 // POST /improve-summary
-// Rewrites the user's professional summary using their full resume context
 // ═════════════════════════════════════════════════════════════════════════════
 app.post('/improve-summary', async (req, res) => {
 
     try {
         const { name, title, summary, skills = [], experience = [] } = req.body;
 
-        // Build context from experience
         const expContext = experience
             .filter(e => e.company || e.title)
             .slice(0, 3)
@@ -472,9 +499,9 @@ app.post('/improve-summary', async (req, res) => {
 Write a new professional summary for this person.
 
 PERSON:
-Name: ${name || 'Unknown'}
-Title: ${title || 'Professional'}
-Current summary: ${summary || '(none provided)'}
+Name: ${sanitizeInput(name) || 'Unknown'}
+Title: ${sanitizeInput(title) || 'Professional'}
+Current summary: ${sanitizeInput(summary) || '(none provided)'}
 Top skills: ${topSkills || '(not provided)'}
 Recent experience: ${expContext || '(not provided)'}
 
@@ -510,7 +537,6 @@ REQUIREMENTS:
 
 // ═════════════════════════════════════════════════════════════════════════════
 // POST /review-resume
-// Returns actionable feedback on the complete resume
 // ═════════════════════════════════════════════════════════════════════════════
 app.post('/review-resume', async (req, res) => {
 
@@ -581,11 +607,6 @@ app.listen(PORT, () => {
 });
 
 app.use((err, req, res, next) => {
-
     console.error(err);
-
-    res.status(500).json({
-        error:
-            'Something went wrong.'
-    });
+    res.status(500).json({ error: 'Something went wrong.' });
 });
