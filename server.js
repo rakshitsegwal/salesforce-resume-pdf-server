@@ -19,6 +19,14 @@ app.use(cors({
 
 app.use(express.json({ limit: '20mb' }));   // Increased for base64 inspiration images
 
+// Extend server response timeout to 120s — inspiration flow makes 2 OpenAI calls
+app.use((req, res, next) => {
+    res.setTimeout(120000, () => {
+        res.status(503).json({ error: 'Request timed out. Please try again.' });
+    });
+    next();
+});
+
 app.use(
     helmet({
         crossOriginEmbedderPolicy: false,
