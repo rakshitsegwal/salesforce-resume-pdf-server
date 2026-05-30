@@ -35,7 +35,7 @@ app.use(
 );
 
 // ─── Version marker ───────────────────────────────────────────────────────────
-const SERVER_VERSION = 'v5-ai-flow-gallery-2026';
+const SERVER_VERSION = 'v6-job-match-2026';
 const BOOT_TIME      = Date.now();
 
 // ─── Rate limiters ────────────────────────────────────────────────────────────
@@ -58,12 +58,16 @@ app.use('/extract-resume',          aiLimiter);
 app.use('/review-resume',           aiLimiter);
 app.use('/improve-summary',         aiLimiter);
 app.use('/generate-pdf',            exportLimiter);
+app.use('/analyze-job-match',        aiLimiter);
+app.use('/optimize-for-job',         aiLimiter);
 
 app.use('/generate-template',       validateClientSession);
 app.use('/extract-resume',          validateClientSession);
 app.use('/review-resume',           validateClientSession);
 app.use('/improve-summary',         validateClientSession);
 app.use('/generate-pdf',            validateClientSession);
+app.use('/analyze-job-match',        validateClientSession);
+app.use('/optimize-for-job',         validateClientSession);
 
 // ─── Health / version ─────────────────────────────────────────────────────────
 app.get('/version', (req, res) => {
@@ -604,6 +608,201 @@ Keep response under 250 words. Be direct and specific — no generic advice.`;
         res.status(500).json({ error: 'Resume review failed' });
     }
 });
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+// POST /analyze-job-match
+// Analyses resume against a job description — returns scores + gap analysis
+// ═════════════════════════════════════════════════════════════════════════════
+app.post('/analyze-job-match', async (req, res) => {
+    try {
+        const { resumeData, jobDescription } = req.body;
+
+        if (!jobDescription || jobDescription.trim().length < 30) {
+            return res.status(400).json({ error: 'Job description is too short.' });
+        }
+
+        const resumeText = buildResumeText(resumeData);
+        const jdText     = truncateText(sanitizeInput(jobDescription), 6000);
+
+        const systemPrompt = `You are an expert ATS analyst and senior technical recruiter.
+You deeply understand how applicant tracking systems score resumes and what hiring managers look for.
+Analyse the resume against the job description and return ONLY valid JSON — no markdown, no explanation.`;
+
+        const userPrompt = `RESUME:
+${resumeText}
+
+JOB DESCRIPTION:
+${jdText}
+
+SCORING INSTRUCTIONS:
+- atsScore (0-100): Consider keyword density, section completeness (has summary/skills/experience/education), measurable achievements, clear formatting signals, contact info completeness.
+- jdMatch (0-100): Consider skill overlap, keyword overlap, responsibility alignment, seniority match between resume and JD.
+- keywordCoverage (0-100): % of important technical/domain keywords from the JD that appear anywhere in the resume.
+- skillsCoverage (0-100): % of explicitly required skills/tools from the JD found in the resume skills list.
+
+Be realistic and calibrated — a resume with no JD overlap should score 30-50 on jdMatch, not 70+.
+
+Return ONLY this JSON structure:
+{
+  "atsScore": <integer 0-100>,
+  "jdMatch": <integer 0-100>,
+  "keywordCoverage": <integer 0-100>,
+  "skillsCoverage": <integer 0-100>,
+  "missingKeywords": [<up to 8 important JD keywords/tools not found anywhere in resume>],
+  "missingSkills": [<up to 6 required skills from JD not in resume skills list>],
+  "strengths": [<3-4 specific strengths of this resume FOR this particular JD — be specific, not generic>],
+  "weaknesses": [<3-4 specific gaps or weak spots for this JD — be specific and actionable>],
+  "summarySuggestions": [<2-3 concrete suggestions to improve the summary to better match this JD>],
+  "experienceSuggestions": [<2-3 concrete suggestions to strengthen experience bullets for this JD>]
+}`;
+
+        const completion = await openai.chat.completions.create({
+            model:           'gpt-4.1-mini',
+            messages:        [
+                { role: 'system', content: systemPrompt },
+                { role: 'user',   content: userPrompt   }
+            ],
+            temperature:     0.2,
+            response_format: { type: 'json_object' }
+        });
+
+        const result = JSON.parse(completion.choices[0].message.content);
+
+        // Clamp scores to valid range
+        ['atsScore','jdMatch','keywordCoverage','skillsCoverage'].forEach(k => {
+            if (typeof result[k] === 'number') {
+                result[k] = Math.max(0, Math.min(100, Math.round(result[k])));
+            }
+        });
+
+        // Ensure arrays
+        ['missingKeywords','missingSkills','strengths','weaknesses',
+         'summarySuggestions','experienceSuggestions'].forEach(k => {
+            if (!Array.isArray(result[k])) result[k] = [];
+        });
+
+        res.json(result);
+
+    } catch (e) {
+        console.error('Job match analysis error:', e);
+        res.status(500).json({ error: 'Job match analysis failed' });
+    }
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// POST /optimize-for-job
+// Rewrites resume content (summary + bullets) to target a specific JD
+// NEVER invents experience — only rephrases existing content
+// ═════════════════════════════════════════════════════════════════════════════
+app.post('/optimize-for-job', async (req, res) => {
+    try {
+        const { resumeData, jobDescription } = req.body;
+
+        if (!jobDescription || jobDescription.trim().length < 30) {
+            return res.status(400).json({ error: 'Job description is too short.' });
+        }
+
+        const resumeText = buildResumeText(resumeData);
+        const jdText     = truncateText(sanitizeInput(jobDescription), 6000);
+
+        const systemPrompt = `You are an expert resume writer specialising in ATS optimisation.
+Your task is to rephrase and strengthen existing resume content to better match a job description.
+
+ABSOLUTE RULES — violating these makes the output useless:
+1. NEVER invent companies, job titles, dates, degrees, certifications, or projects
+2. NEVER add skills or certifications the candidate has not demonstrated
+3. ONLY rephrase, reword, or restructure existing content
+4. Incorporate JD keywords NATURALLY into existing bullets — do not stuff
+5. Use strong action verbs (Led, Architected, Delivered, Optimised, Reduced, Increased, etc.)
+6. Add quantification where the original implies scale but lacks numbers (use phrases like "significantly" or "across enterprise-scale systems" if no numbers exist)
+7. Keep bullets concise — max 120 characters each
+8. Return ONLY valid JSON — no markdown, no explanation`;
+
+        const userPrompt = `Optimise this resume for the job description below.
+
+CURRENT RESUME:
+${resumeText}
+
+JOB DESCRIPTION:
+${jdText}
+
+Return ONLY this JSON (preserve all original companies/titles/dates exactly):
+{
+  "summary": "<optimised professional summary — 3-4 sentences, incorporating JD keywords naturally>",
+  "skills": [<optimised skills array — keep all existing skills, reorder by JD relevance, may add 1-3 clearly implied skills based on their experience>],
+  "experiences": [
+    {
+      "company": "<EXACT same company name>",
+      "title": "<EXACT same job title>",
+      "startDate": "<EXACT same>",
+      "endDate": "<EXACT same>",
+      "bullets": ["<optimised bullet 1>", "<optimised bullet 2>", "<optimised bullet 3>"]
+    }
+  ]
+}`;
+
+        const completion = await openai.chat.completions.create({
+            model:           'gpt-4.1-mini',
+            messages:        [
+                { role: 'system', content: systemPrompt },
+                { role: 'user',   content: userPrompt   }
+            ],
+            temperature:     0.4,
+            response_format: { type: 'json_object' }
+        });
+
+        const result = JSON.parse(completion.choices[0].message.content);
+
+        // Validate structure — ensure experiences match input
+        if (result.experiences && resumeData?.experiences) {
+            result.experiences = result.experiences.map((optExp, i) => {
+                const original = resumeData.experiences[i] || {};
+                return {
+                    ...original,               // preserve all original fields (key, dateRange, etc.)
+                    summary:   optExp.summary,
+                    bullets:   (optExp.bullets || []).slice(0, 5),
+                    bulletsRaw: (optExp.bullets || []).join('\n')
+                };
+            });
+        }
+
+        res.json({ optimizedResume: result });
+
+    } catch (e) {
+        console.error('Job optimize error:', e);
+        res.status(500).json({ error: 'Resume optimisation failed' });
+    }
+});
+
+// ─── Resume text builder helper ───────────────────────────────────────────────
+function buildResumeText(resumeData) {
+    if (!resumeData) return 'No resume data provided.';
+    const lines = [];
+    if (resumeData.fullName)  lines.push(`Name: ${resumeData.fullName}`);
+    if (resumeData.title)     lines.push(`Title: ${resumeData.title}`);
+    if (resumeData.summary)   lines.push(`\nSummary:\n${resumeData.summary}`);
+    if (resumeData.skills?.length) {
+        lines.push(`\nSkills: ${resumeData.skills.join(', ')}`);
+    }
+    if (resumeData.certifications?.length) {
+        lines.push(`\nCertifications: ${resumeData.certifications.join(', ')}`);
+    }
+    if (resumeData.experiences?.length) {
+        lines.push('\nExperience:');
+        resumeData.experiences.forEach(exp => {
+            lines.push(`  ${exp.title || ''} at ${exp.company || ''} (${exp.dateRange || [exp.startDate, exp.endDate].filter(Boolean).join(' – ')})`);
+            (exp.bullets || []).forEach(b => lines.push(`    • ${b}`));
+        });
+    }
+    if (resumeData.education?.length) {
+        lines.push('\nEducation:');
+        resumeData.education.forEach(edu => {
+            lines.push(`  ${edu.degree || ''} ${edu.field ? ', ' + edu.field : ''} — ${edu.school || ''} (${edu.years || ''})`);
+        });
+    }
+    return lines.join('\n');
+}
 
 // ═════════════════════════════════════════════════════════════════════════════
 // Start
