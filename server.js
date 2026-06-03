@@ -609,52 +609,136 @@ Keep response under 250 words. Be direct and specific — no generic advice.`;
     }
 });
 
+// ═════════════════════════════════════════════════════════════════════════════
+// Start
+// ═════════════════════════════════════════════════════════════════════════════
+const PORT = process.env.PORT || 3000;
 
-// ═════════════════════════════════════════════════════════════════════════════
-// POST /analyze-job-match
-// Analyses resume against a job description — returns scores + gap analysis
-// ═════════════════════════════════════════════════════════════════════════════
+// ─── Helper: turn resumeData or resumeText into a readable string ─────────────
+function buildResumeString(resumeData, resumeText) {
+    // If we have structured data, use it (gives GPT cleaner, more structured input)
+    // Append raw text only if structured data seems sparse (no experiences)
+    const hasStructured = resumeData && (
+        resumeData.fullName || resumeData.summary || resumeData.experiences?.length
+    );
+
+    if (hasStructured) {
+        // Serialize the structured resumeData
+        const structured = serializeResumeData(resumeData);
+        // If we also have raw text and experiences are missing, append it for extra context
+        if (resumeText && !resumeData.experiences?.length) {
+            return (structured + '\n\n--- ADDITIONAL CONTEXT FROM UPLOADED FILE ---\n' + resumeText).slice(0, 8000);
+        }
+        return structured.slice(0, 8000);
+    }
+
+    // No structured data — use raw text directly (uploaded-only flow)
+    if (resumeText && resumeText.trim().length > 50) {
+        return resumeText.trim().slice(0, 8000);
+    }
+
+    // Otherwise serialize the structured formData from the builder
+    if (!resumeData) return 'No resume data provided.';
+    return serializeResumeData(resumeData);
+}
+
+function serializeResumeData(resumeData) {
+    if (!resumeData) return 'No resume data provided.';
+    const lines = [];
+    if (resumeData.fullName)  lines.push(`Name: ${resumeData.fullName}`);
+    if (resumeData.title)     lines.push(`Title: ${resumeData.title}`);
+    if (resumeData.email)     lines.push(`Email: ${resumeData.email}`);
+    if (resumeData.location)  lines.push(`Location: ${resumeData.location}`);
+    if (resumeData.summary)   lines.push(`\nSummary:\n${resumeData.summary}`);
+    if (resumeData.skills?.length)
+        lines.push(`\nSkills: ${resumeData.skills.join(', ')}`);
+    if (resumeData.certifications?.length)
+        lines.push(`Certifications: ${resumeData.certifications.join(', ')}`);
+    if (resumeData.experiences?.length) {
+        lines.push('\nExperience:');
+        resumeData.experiences.forEach(exp => {
+            const dates = exp.dateRange || [exp.startDate, exp.endDate].filter(Boolean).join(' – ');
+            lines.push(`  ${exp.title || ''} at ${exp.company || ''} (${dates})`);
+            (exp.bullets || []).forEach(b => lines.push(`    • ${b}`));
+        });
+    }
+    if (resumeData.education?.length) {
+        lines.push('\nEducation:');
+        resumeData.education.forEach(edu => {
+            lines.push(`  ${edu.degree || ''}${edu.field ? ', ' + edu.field : ''} — ${edu.school || ''} (${edu.years || ''})`);
+        });
+    }
+    return lines.join('\n').slice(0, 8000);
+}
+
+// ─── POST /analyze-job-match ──────────────────────────────────────────────────
+// Accepts either { resumeData, jobDescription } or { resumeText, jobDescription }
+// Returns structured gap analysis: scores + specific actionable suggestions
+// ─────────────────────────────────────────────────────────────────────────────
 app.post('/analyze-job-match', async (req, res) => {
     try {
-        const { resumeData, jobDescription } = req.body;
+        const { resumeData, resumeText, jobDescription } = req.body;
 
         if (!jobDescription || jobDescription.trim().length < 30) {
             return res.status(400).json({ error: 'Job description is too short.' });
         }
 
-        const resumeText = buildResumeText(resumeData);
-        const jdText     = truncateText(sanitizeInput(jobDescription), 6000);
+        const resumeString = buildResumeString(resumeData, resumeText);
 
-        const systemPrompt = `You are an expert ATS analyst and senior technical recruiter.
-You deeply understand how applicant tracking systems score resumes and what hiring managers look for.
-Analyse the resume against the job description and return ONLY valid JSON — no markdown, no explanation.`;
+        if (resumeString.length < 20) {
+            return res.status(400).json({ error: 'Resume is empty. Please upload a resume or fill in the builder first.' });
+        }
 
-        const userPrompt = `RESUME:
-${resumeText}
+        const systemPrompt = `You are a senior technical recruiter and ATS specialist with 15 years of experience.
+You analyse resumes against job descriptions and give precise, actionable feedback.
+Your feedback must be SPECIFIC to this exact resume and JD — never generic.
+You return ONLY valid JSON, no markdown, no explanation outside the JSON.`;
 
-JOB DESCRIPTION:
-${jdText}
+        const userPrompt = `Analyse this resume against the job description. Be precise and specific.
 
-SCORING INSTRUCTIONS:
-- atsScore (0-100): Consider keyword density, section completeness (has summary/skills/experience/education), measurable achievements, clear formatting signals, contact info completeness.
-- jdMatch (0-100): Consider skill overlap, keyword overlap, responsibility alignment, seniority match between resume and JD.
-- keywordCoverage (0-100): % of important technical/domain keywords from the JD that appear anywhere in the resume.
-- skillsCoverage (0-100): % of explicitly required skills/tools from the JD found in the resume skills list.
+=== RESUME ===
+${resumeString}
 
-Be realistic and calibrated — a resume with no JD overlap should score 30-50 on jdMatch, not 70+.
+=== JOB DESCRIPTION ===
+${jobDescription.trim().slice(0, 5000)}
 
-Return ONLY this JSON structure:
+=== SCORING RULES ===
+- atsScore (0–100): How well the resume is structured for ATS parsing. Consider: section headings present, contact info visible, no tables/columns that break parsing, bullet points used, quantified achievements, appropriate length.
+- jdMatch (0–100): How well the candidate's actual experience and skills match what the JD requires. Be realistic — a mismatch in seniority or core skills should give a low score.
+- keywordCoverage (0–100): Percentage of important technical/domain keywords from the JD that appear anywhere in the resume.
+- skillsCoverage (0–100): Percentage of explicitly listed required skills in the JD that appear in the resume skills section.
+
+=== OUTPUT FORMAT ===
+Return ONLY this JSON (no markdown fences):
 {
-  "atsScore": <integer 0-100>,
-  "jdMatch": <integer 0-100>,
-  "keywordCoverage": <integer 0-100>,
-  "skillsCoverage": <integer 0-100>,
-  "missingKeywords": [<up to 8 important JD keywords/tools not found anywhere in resume>],
-  "missingSkills": [<up to 6 required skills from JD not in resume skills list>],
-  "strengths": [<3-4 specific strengths of this resume FOR this particular JD — be specific, not generic>],
-  "weaknesses": [<3-4 specific gaps or weak spots for this JD — be specific and actionable>],
-  "summarySuggestions": [<2-3 concrete suggestions to improve the summary to better match this JD>],
-  "experienceSuggestions": [<2-3 concrete suggestions to strengthen experience bullets for this JD>]
+  "atsScore": <integer 0–100>,
+  "jdMatch": <integer 0–100>,
+  "keywordCoverage": <integer 0–100>,
+  "skillsCoverage": <integer 0–100>,
+  "missingKeywords": [
+    "<specific keyword from JD not in resume — be exact, e.g. 'Salesforce CPQ' not 'CRM tools'>",
+    ... up to 8 items
+  ],
+  "missingSkills": [
+    "<specific skill required by JD not in resume skills — be exact>",
+    ... up to 6 items
+  ],
+  "strengths": [
+    "<specific strength this resume has FOR THIS JD — reference actual content, e.g. '7 years of Apex development aligns with the Senior Developer requirement'>",
+    ... 3–4 items
+  ],
+  "weaknesses": [
+    "<specific, actionable gap — tell the candidate EXACTLY what to fix, e.g. 'Your summary does not mention Salesforce Lightning which appears 4 times in the JD — add it in the first sentence'>",
+    ... 3–5 items
+  ],
+  "summarySuggestions": [
+    "<concrete instruction for improving the summary for this specific JD — e.g. 'Add the phrase cloud-based CRM architecture to your summary opening line'>",
+    ... 2–3 items
+  ],
+  "experienceSuggestions": [
+    "<specific instruction for an experience bullet — e.g. 'Under your Infosys role, add a bullet quantifying how many Salesforce orgs you managed'>",
+    ... 2–3 items
+  ]
 }`;
 
         const completion = await openai.chat.completions.create({
@@ -667,77 +751,85 @@ Return ONLY this JSON structure:
             response_format: { type: 'json_object' }
         });
 
-        const result = JSON.parse(completion.choices[0].message.content);
+        let result;
+        try {
+            result = JSON.parse(completion.choices[0].message.content);
+        } catch (parseErr) {
+            console.error('JSON parse error:', parseErr);
+            return res.status(500).json({ error: 'Failed to parse AI response.' });
+        }
 
-        // Clamp scores to valid range
+        // Clamp scores to 0–100
         ['atsScore','jdMatch','keywordCoverage','skillsCoverage'].forEach(k => {
-            if (typeof result[k] === 'number') {
-                result[k] = Math.max(0, Math.min(100, Math.round(result[k])));
-            }
+            if (typeof result[k] === 'number') result[k] = Math.max(0, Math.min(100, Math.round(result[k])));
         });
 
-        // Ensure arrays
+        // Ensure all array fields exist
         ['missingKeywords','missingSkills','strengths','weaknesses',
          'summarySuggestions','experienceSuggestions'].forEach(k => {
             if (!Array.isArray(result[k])) result[k] = [];
         });
 
+        console.log(`[${SERVER_VERSION}] /analyze-job-match — ATS:${result.atsScore} JD:${result.jdMatch}`);
         res.json(result);
 
-    } catch (e) {
-        console.error('Job match analysis error:', e);
-        res.status(500).json({ error: 'Job match analysis failed' });
+    } catch (err) {
+        console.error('/analyze-job-match error:', err);
+        res.status(500).json({ error: 'Job match analysis failed. Please try again.' });
     }
 });
 
-// ═════════════════════════════════════════════════════════════════════════════
-// POST /optimize-for-job
-// Rewrites resume content (summary + bullets) to target a specific JD
-// NEVER invents experience — only rephrases existing content
-// ═════════════════════════════════════════════════════════════════════════════
+// ─── POST /optimize-for-job ───────────────────────────────────────────────────
+// Rewrites resume summary + experience bullets to target the JD
+// NEVER invents facts — only rephrases existing content
+// ─────────────────────────────────────────────────────────────────────────────
 app.post('/optimize-for-job', async (req, res) => {
     try {
-        const { resumeData, jobDescription } = req.body;
+        const { resumeData, resumeText, jobDescription } = req.body;
 
         if (!jobDescription || jobDescription.trim().length < 30) {
             return res.status(400).json({ error: 'Job description is too short.' });
         }
 
-        const resumeText = buildResumeText(resumeData);
-        const jdText     = truncateText(sanitizeInput(jobDescription), 6000);
+        const resumeString = buildResumeString(resumeData, resumeText);
 
         const systemPrompt = `You are an expert resume writer specialising in ATS optimisation.
-Your task is to rephrase and strengthen existing resume content to better match a job description.
+You rewrite resume content to better match a specific job description.
 
-ABSOLUTE RULES — violating these makes the output useless:
-1. NEVER invent companies, job titles, dates, degrees, certifications, or projects
-2. NEVER add skills or certifications the candidate has not demonstrated
-3. ONLY rephrase, reword, or restructure existing content
-4. Incorporate JD keywords NATURALLY into existing bullets — do not stuff
-5. Use strong action verbs (Led, Architected, Delivered, Optimised, Reduced, Increased, etc.)
-6. Add quantification where the original implies scale but lacks numbers (use phrases like "significantly" or "across enterprise-scale systems" if no numbers exist)
-7. Keep bullets concise — max 120 characters each
-8. Return ONLY valid JSON — no markdown, no explanation`;
+ABSOLUTE RULES — breaking any of these makes the output worthless:
+1. NEVER invent companies, job titles, dates, degrees, or certifications
+2. NEVER add skills or achievements the candidate has not demonstrated  
+3. ONLY rephrase, reword, or restructure EXISTING content
+4. Incorporate JD keywords NATURALLY — never stuff them awkwardly
+5. Use strong action verbs: Led, Architected, Delivered, Reduced, Increased, Launched, Scaled
+6. Keep bullets concise — maximum 130 characters each
+7. Return ONLY valid JSON — no markdown, no explanation`;
 
         const userPrompt = `Optimise this resume for the job description below.
 
-CURRENT RESUME:
-${resumeText}
+=== RESUME ===
+${resumeString}
 
-JOB DESCRIPTION:
-${jdText}
+=== JOB DESCRIPTION ===
+${jobDescription.trim().slice(0, 5000)}
 
-Return ONLY this JSON (preserve all original companies/titles/dates exactly):
+=== INSTRUCTIONS ===
+1. Rewrite the professional summary (3–4 sentences) to open with the candidate's most relevant strength for this specific role, then incorporate the top 3–4 keywords from the JD naturally.
+2. For each experience role, rewrite or strengthen the bullet points to highlight achievements and responsibilities that align with the JD requirements. Do NOT add bullets that aren't based on existing content.
+3. Reorder the skills array so the most JD-relevant skills appear first. You may add 1–2 skills that are clearly implied by their experience (e.g. if they built Salesforce integrations, adding "REST API Integration" is fair).
+4. Keep ALL company names, titles, dates, and education exactly as-is.
+
+Return ONLY this JSON:
 {
-  "summary": "<optimised professional summary — 3-4 sentences, incorporating JD keywords naturally>",
-  "skills": [<optimised skills array — keep all existing skills, reorder by JD relevance, may add 1-3 clearly implied skills based on their experience>],
+  "summary": "<optimised summary>",
+  "skills": ["<skill1>", "<skill2>", ...],
   "experiences": [
     {
       "company": "<EXACT same company name>",
-      "title": "<EXACT same job title>",
+      "title": "<EXACT same title>",
       "startDate": "<EXACT same>",
       "endDate": "<EXACT same>",
-      "bullets": ["<optimised bullet 1>", "<optimised bullet 2>", "<optimised bullet 3>"]
+      "bullets": ["<optimised bullet>", ...]
     }
   ]
 }`;
@@ -748,66 +840,39 @@ Return ONLY this JSON (preserve all original companies/titles/dates exactly):
                 { role: 'system', content: systemPrompt },
                 { role: 'user',   content: userPrompt   }
             ],
-            temperature:     0.4,
+            temperature:     0.35,
             response_format: { type: 'json_object' }
         });
 
-        const result = JSON.parse(completion.choices[0].message.content);
+        let result;
+        try {
+            result = JSON.parse(completion.choices[0].message.content);
+        } catch (parseErr) {
+            return res.status(500).json({ error: 'Failed to parse AI response.' });
+        }
 
-        // Validate structure — ensure experiences match input
-        if (result.experiences && resumeData?.experiences) {
+        // If we have structured resumeData, merge the optimised content back in
+        // so company/title/dates are always preserved from the original
+        if (resumeData?.experiences?.length && result.experiences?.length) {
             result.experiences = result.experiences.map((optExp, i) => {
-                const original = resumeData.experiences[i] || {};
+                const orig = resumeData.experiences[i] || {};
                 return {
-                    ...original,               // preserve all original fields (key, dateRange, etc.)
-                    summary:   optExp.summary,
-                    bullets:   (optExp.bullets || []).slice(0, 5),
-                    bulletsRaw: (optExp.bullets || []).join('\n')
+                    ...orig,
+                    bullets:    optExp.bullets?.slice(0, 6) || orig.bullets || [],
+                    bulletsRaw: (optExp.bullets || orig.bullets || []).join('\n')
                 };
             });
         }
 
+        console.log(`[${SERVER_VERSION}] /optimize-for-job completed`);
         res.json({ optimizedResume: result });
 
-    } catch (e) {
-        console.error('Job optimize error:', e);
-        res.status(500).json({ error: 'Resume optimisation failed' });
+    } catch (err) {
+        console.error('/optimize-for-job error:', err);
+        res.status(500).json({ error: 'Resume optimisation failed. Please try again.' });
     }
 });
 
-// ─── Resume text builder helper ───────────────────────────────────────────────
-function buildResumeText(resumeData) {
-    if (!resumeData) return 'No resume data provided.';
-    const lines = [];
-    if (resumeData.fullName)  lines.push(`Name: ${resumeData.fullName}`);
-    if (resumeData.title)     lines.push(`Title: ${resumeData.title}`);
-    if (resumeData.summary)   lines.push(`\nSummary:\n${resumeData.summary}`);
-    if (resumeData.skills?.length) {
-        lines.push(`\nSkills: ${resumeData.skills.join(', ')}`);
-    }
-    if (resumeData.certifications?.length) {
-        lines.push(`\nCertifications: ${resumeData.certifications.join(', ')}`);
-    }
-    if (resumeData.experiences?.length) {
-        lines.push('\nExperience:');
-        resumeData.experiences.forEach(exp => {
-            lines.push(`  ${exp.title || ''} at ${exp.company || ''} (${exp.dateRange || [exp.startDate, exp.endDate].filter(Boolean).join(' – ')})`);
-            (exp.bullets || []).forEach(b => lines.push(`    • ${b}`));
-        });
-    }
-    if (resumeData.education?.length) {
-        lines.push('\nEducation:');
-        resumeData.education.forEach(edu => {
-            lines.push(`  ${edu.degree || ''} ${edu.field ? ', ' + edu.field : ''} — ${edu.school || ''} (${edu.years || ''})`);
-        });
-    }
-    return lines.join('\n');
-}
-
-// ═════════════════════════════════════════════════════════════════════════════
-// Start
-// ═════════════════════════════════════════════════════════════════════════════
-const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
     console.log(`[${SERVER_VERSION}] Server running on port ${PORT}`);
