@@ -17,7 +17,28 @@ app.use(cors({
     allowedHeaders: ['Content-Type', 'x-client-id']
 }));
 
-app.use(express.json({ limit: '20mb' }));   // Increased for base64 inspiration images
+// Body size: 10mb handles base64 images but limits abuse headroom
+app.use(express.json({ limit: '10mb' }));
+
+// ─── Request ID + logger ─────────────────────────────────────────────────────
+app.use((req, res, next) => {
+    const reqId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2,7)}`;
+    res.setHeader('X-Request-ID', reqId);
+    req.reqId = reqId;
+
+    const start = Date.now();
+    res.on('finish', () => {
+        const ms  = Date.now() - start;
+        const cid = (req.headers['x-client-id'] || 'none').slice(0, 40);
+        console.log(`[${new Date().toISOString()}] ${req.method} ${req.path} ${res.statusCode} ${ms}ms cid=${cid} rid=${req.reqId}`);
+
+        // Alert on suspicious patterns
+        if (res.statusCode === 429) {
+            console.warn(`[RATE-LIMIT] cid=${cid} ip=${req.ip} path=${req.path}`);
+        }
+    });
+    next();
+});
 
 // Extend server response timeout to 120s — inspiration flow makes 2 OpenAI calls
 app.use((req, res, next) => {
@@ -35,39 +56,89 @@ app.use(
 );
 
 // ─── Version marker ───────────────────────────────────────────────────────────
-const SERVER_VERSION = 'v6-job-match-2026';
+const SERVER_VERSION = 'v7-hardened-2026';
 const BOOT_TIME      = Date.now();
 
-// ─── Rate limiters ────────────────────────────────────────────────────────────
+// ─── IP-based rate limiters (first line of defence) ─────────────────────────
 const aiLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: 20,
+    windowMs: 15 * 60 * 1000,   // 15 minutes
+    max: 20,                     // 20 AI calls per IP per window
     standardHeaders: true,
     legacyHeaders: false,
-    message: { error: 'Too many AI requests. Please try again later.' }
+    message: { error: 'Too many AI requests. Please try again in 15 minutes.' }
 });
 
 const exportLimiter = rateLimit({
-    windowMs: 60 * 60 * 1000,
-    max: 5,
-    message: { error: 'PDF export limit reached. Please try later.' }
+    windowMs: 60 * 60 * 1000,   // 1 hour
+    max: 5,                      // 5 PDF exports per IP per hour
+    message: { error: 'PDF export limit reached. Please try again later.' }
 });
 
-app.use('/generate-template',       aiLimiter);
-app.use('/extract-resume',          aiLimiter);
-app.use('/review-resume',           aiLimiter);
-app.use('/improve-summary',         aiLimiter);
-app.use('/generate-pdf',            exportLimiter);
-app.use('/analyze-job-match',        aiLimiter);
-app.use('/optimize-for-job',         aiLimiter);
+// ─── Per-clientId rate limiter (second line of defence) ──────────────────────
+// Prevents abuse from users who rotate IPs but keep the same browser session.
+// Uses an in-memory Map; resets on server restart.
+const clientIdCalls = new Map();   // clientId → { count, windowStart }
+const CLIENT_ID_LIMIT        = 15; // max AI calls per clientId per window
+const CLIENT_ID_WINDOW_MS    = 15 * 60 * 1000; // 15 minutes
 
-app.use('/generate-template',       validateClientSession);
-app.use('/extract-resume',          validateClientSession);
-app.use('/review-resume',           validateClientSession);
-app.use('/improve-summary',         validateClientSession);
-app.use('/generate-pdf',            validateClientSession);
-app.use('/analyze-job-match',        validateClientSession);
-app.use('/optimize-for-job',         validateClientSession);
+function perClientIdLimiter(req, res, next) {
+    const clientId = req.headers['x-client-id'];
+    if (!clientId) return next(); // validateClientSession handles missing id
+
+    const now    = Date.now();
+    const record = clientIdCalls.get(clientId);
+
+    if (!record || (now - record.windowStart) > CLIENT_ID_WINDOW_MS) {
+        // Fresh window
+        clientIdCalls.set(clientId, { count: 1, windowStart: now });
+        return next();
+    }
+
+    if (record.count >= CLIENT_ID_LIMIT) {
+        console.warn(`[CLIENT-LIMIT] cid=${clientId.slice(0,40)} blocked (${record.count} calls in window)`);
+        return res.status(429).json({
+            error: 'You have made too many requests. Please wait 15 minutes before trying again.'
+        });
+    }
+
+    record.count++;
+    return next();
+}
+
+// Prune stale entries every 30 minutes to prevent memory leak
+setInterval(() => {
+    const cutoff = Date.now() - CLIENT_ID_WINDOW_MS;
+    for (const [id, rec] of clientIdCalls.entries()) {
+        if (rec.windowStart < cutoff) clientIdCalls.delete(id);
+    }
+}, 30 * 60 * 1000);
+
+// IP-based rate limits
+app.use('/generate-template',   aiLimiter);
+app.use('/extract-resume',      aiLimiter);
+app.use('/review-resume',       aiLimiter);
+app.use('/improve-summary',     aiLimiter);
+app.use('/generate-pdf',        exportLimiter);
+app.use('/analyze-job-match',   aiLimiter);
+app.use('/optimize-for-job',    aiLimiter);
+
+// Session validation (must come before per-clientId limiter)
+app.use('/generate-template',   validateClientSession);
+app.use('/extract-resume',      validateClientSession);
+app.use('/review-resume',       validateClientSession);
+app.use('/improve-summary',     validateClientSession);
+app.use('/generate-pdf',        validateClientSession);
+app.use('/analyze-job-match',   validateClientSession);
+app.use('/optimize-for-job',    validateClientSession);
+
+// Per-clientId limits (second layer — catches proxy rotators)
+app.use('/generate-template',   perClientIdLimiter);
+app.use('/extract-resume',      perClientIdLimiter);
+app.use('/review-resume',       perClientIdLimiter);
+app.use('/improve-summary',     perClientIdLimiter);
+app.use('/generate-pdf',        perClientIdLimiter);
+app.use('/analyze-job-match',   perClientIdLimiter);
+app.use('/optimize-for-job',    perClientIdLimiter);
 
 // ─── Health / version ─────────────────────────────────────────────────────────
 app.get('/version', (req, res) => {
@@ -80,10 +151,19 @@ app.get('/version', (req, res) => {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
+// Accepts: standard UUID (36 chars), or UUID-with-extras (up to 72 chars)
+// Rejects: SQL injection strings, script tags, arbitrary text
+const CLIENT_ID_PATTERN = /^[a-zA-Z0-9\-_]{8,72}$/;
+
 function validateClientSession(req, res, next) {
     const clientId = req.headers['x-client-id'];
-    if (!clientId)           return res.status(400).json({ error: 'Missing client session.' });
-    if (clientId.length > 100) return res.status(400).json({ error: 'Invalid client session.' });
+    if (!clientId) {
+        return res.status(400).json({ error: 'Missing client session.' });
+    }
+    if (!CLIENT_ID_PATTERN.test(clientId)) {
+        console.warn(`[INVALID-CID] Rejected clientId: "${clientId.slice(0,60)}"`);
+        return res.status(400).json({ error: 'Invalid client session format.' });
+    }
     next();
 }
 
@@ -154,6 +234,18 @@ html, body {
 // ═════════════════════════════════════════════════════════════════════════════
 // POST /generate-pdf
 // ═════════════════════════════════════════════════════════════════════════════
+// Strips dangerous HTML tags from PDF payload before Puppeteer renders it
+function sanitizePdfHtml(html) {
+    if (!html) return '';
+    return html
+        .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '')
+        .replace(/<iframe\b[^>]*>.*?<\/iframe>/gi, '')
+        .replace(/on\w+\s*=\s*["'][^"']*["']/gi, '')       // strip inline handlers
+        .replace(/javascript\s*:/gi, '')                      // strip js: hrefs
+        .replace(/<link[^>]+rel\s*=\s*["']?import["']?[^>]*>/gi, '') // strip imports
+        .slice(0, 500000);  // hard cap: 500kb of HTML max
+}
+
 app.post('/generate-pdf', async (req, res) => {
 
     console.log(`[${SERVER_VERSION}] /generate-pdf`, new Date().toISOString(), {
@@ -680,7 +772,13 @@ app.post('/analyze-job-match', async (req, res) => {
         const { resumeData, resumeText, jobDescription } = req.body;
 
         if (!jobDescription || jobDescription.trim().length < 30) {
-            return res.status(400).json({ error: 'Job description is too short.' });
+            return res.status(400).json({ error: 'Job description is too short (minimum 30 characters).' });
+        }
+        if (jobDescription.length > 6000) {
+            return res.status(400).json({ error: 'Job description is too long. Please paste a maximum of 6000 characters.' });
+        }
+        if (resumeText && resumeText.length > 10000) {
+            return res.status(400).json({ error: 'Resume text is too long. Maximum 10000 characters accepted.' });
         }
 
         const resumeString = buildResumeString(resumeData, resumeText);
@@ -788,7 +886,13 @@ app.post('/optimize-for-job', async (req, res) => {
         const { resumeData, resumeText, jobDescription } = req.body;
 
         if (!jobDescription || jobDescription.trim().length < 30) {
-            return res.status(400).json({ error: 'Job description is too short.' });
+            return res.status(400).json({ error: 'Job description is too short (minimum 30 characters).' });
+        }
+        if (jobDescription.length > 6000) {
+            return res.status(400).json({ error: 'Job description is too long. Maximum 6000 characters accepted.' });
+        }
+        if (resumeText && resumeText.length > 10000) {
+            return res.status(400).json({ error: 'Resume text is too long. Maximum 10000 characters accepted.' });
         }
 
         const resumeString = buildResumeString(resumeData, resumeText);
