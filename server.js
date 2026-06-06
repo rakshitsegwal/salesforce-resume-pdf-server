@@ -139,6 +139,9 @@ app.use('/improve-summary',     perClientIdLimiter);
 app.use('/generate-pdf',        perClientIdLimiter);
 app.use('/analyze-job-match',   perClientIdLimiter);
 app.use('/optimize-for-job',    perClientIdLimiter);
+app.use('/analyze-food',         aiLimiter);
+app.use('/analyze-food',         validateClientSession);
+app.use('/analyze-food',         perClientIdLimiter);
 
 // ─── Health / version ─────────────────────────────────────────────────────────
 app.get('/version', (req, res) => {
@@ -1069,6 +1072,105 @@ Return ONLY this JSON:
     } catch (err) {
         console.error('/optimize-for-job error:', err);
         res.status(500).json({ error: 'Resume optimisation failed. Please try again.' });
+    }
+});
+
+
+// ─── POST /analyze-food ───────────────────────────────────────────────────────
+// Accepts a base64 food image, sends to GPT-4o vision, returns structured
+// calorie and macro breakdown.
+// ─────────────────────────────────────────────────────────────────────────────
+app.post('/analyze-food', async (req, res) => {
+    try {
+        const { imageBase64, mimeType } = req.body;
+
+        if (!imageBase64 || imageBase64.length < 100) {
+            return res.status(400).json({ error: 'No image provided.' });
+        }
+        // Hard cap: 8MB of base64 (~6MB image) to prevent abuse
+        if (imageBase64.length > 10_000_000) {
+            return res.status(400).json({ error: 'Image too large. Maximum 6 MB.' });
+        }
+
+        const validMime = ['image/jpeg','image/jpg','image/png','image/webp','image/heic','image/gif'];
+        const mime = (mimeType || 'image/jpeg').toLowerCase();
+        if (!validMime.includes(mime)) {
+            return res.status(400).json({ error: 'Unsupported image type. Use JPEG, PNG or WebP.' });
+        }
+
+        const completion = await openai.chat.completions.create({
+            model: 'gpt-4o',
+            max_tokens: 1000,
+            messages: [{
+                role: 'user',
+                content: [
+                    {
+                        type: 'image_url',
+                        image_url: {
+                            url: `data:${mime};base64,${imageBase64}`,
+                            detail: 'high'
+                        }
+                    },
+                    {
+                        type: 'text',
+                        text: `You are a professional nutritionist. Analyse this food image and estimate calories and macronutrients.
+
+Be realistic and specific. Base estimates on typical restaurant/home-cooked portion sizes visible in the image.
+
+Return ONLY valid JSON — no markdown, no code fences, no explanation:
+{
+  "items": [
+    {
+      "name": "<specific food name, e.g. 'Grilled Chicken Breast'>",
+      "portion": "<estimated portion, e.g. '150g' or '1 medium piece'>",
+      "calories": <integer kcal>,
+      "protein": <integer grams>,
+      "carbs": <integer grams>,
+      "fat": <integer grams>
+    }
+  ],
+  "totalCalories": <sum of all item calories>,
+  "totalProtein": <sum grams>,
+  "totalCarbs": <sum grams>,
+  "totalFat": <sum grams>,
+  "confidence": "high" | "medium" | "low",
+  "notes": "<any important caveats, e.g. 'Sauce calories estimated as dressing not visible' — keep under 100 words>"
+}
+
+If the image does not contain food, return:
+{ "error": "No food detected in the image." }`
+                    }
+                ]
+            }],
+            response_format: { type: 'json_object' }
+        });
+
+        let result;
+        try {
+            result = JSON.parse(completion.choices[0].message.content);
+        } catch (parseErr) {
+            return res.status(500).json({ error: 'Failed to parse AI response.' });
+        }
+
+        if (result.error) {
+            return res.status(400).json({ error: result.error });
+        }
+
+        // Sanitise: clamp unrealistic values
+        if (result.totalCalories > 5000) result.totalCalories = 5000;
+        (result.items || []).forEach(item => {
+            if (item.calories > 2000) item.calories = 2000;
+            item.protein = Math.max(0, Math.round(item.protein || 0));
+            item.carbs   = Math.max(0, Math.round(item.carbs   || 0));
+            item.fat     = Math.max(0, Math.round(item.fat     || 0));
+        });
+
+        console.log('[analyze-food] items:' + (result.items?.length || 0) + ' total:' + result.totalCalories + 'kcal');
+        res.json(result);
+
+    } catch (err) {
+        console.error('/analyze-food error:', err);
+        res.status(500).json({ error: 'Food analysis failed. Please try again.' });
     }
 });
 
