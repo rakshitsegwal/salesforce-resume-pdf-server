@@ -56,7 +56,7 @@ app.use(
 );
 
 // ─── Version marker ───────────────────────────────────────────────────────────
-const SERVER_VERSION = 'v7-hardened-2026';
+const SERVER_VERSION = 'v8-css-fix-2026';
 const BOOT_TIME      = Date.now();
 
 // ─── IP-based rate limiters (first line of defence) ─────────────────────────
@@ -398,6 +398,98 @@ ${text}`;
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
+
+// ─── AI CSS sanitizer ─────────────────────────────────────────────────────────
+// Strips properties that break the sidebar layout. Called on every AI-generated
+// CSS string before it is returned to the client.
+function sanitizeAiCss(css) {
+    if (!css) return '';
+
+    // 1. Remove absolute/fixed positioning — causes section overlap
+    css = css.replace(/position\s*:\s*(absolute|fixed)\s*(!important)?\s*;/gi, 'position: relative;');
+
+    // 2. Remove negative margins — causes sections to overlap each other
+    css = css.replace(/margin(-top|-bottom|-left|-right)?\s*:\s*-[\d.]+[a-z%]*\s*(!important)?\s*;/gi, '');
+
+    // 3. Remove overflow:hidden on structural containers — clips content
+    css = css.replace(
+        /(\.rb-resume--ai-generated(?:\s+\.rb-resume__(?:sidebar|main|body|section|header))?\s*\{[^}]*?)overflow\s*:\s*hidden\s*(!important)?\s*;/gi,
+        '$1overflow: visible;'
+    );
+
+    // 4. Remove height on sidebar/sections — fixed heights clip content
+    css = css.replace(
+        /(\.rb-resume--ai-generated(?:\s+\.rb-resume__(?:sidebar|section))?\s*\{[^}]*)\bheight\s*:\s*[\d.]+[a-z%]+\s*(!important)?\s*;/gi,
+        '$1min-height: 0;'
+    );
+
+    // 5. Remove float — breaks grid layout
+    css = css.replace(/float\s*:\s*(left|right)\s*(!important)?\s*;/gi, '');
+
+    // 6. Remove display:none — hides content accidentally
+    css = css.replace(/display\s*:\s*none\s*(!important)?\s*;/gi, '');
+
+    // 7. Remove grid/flex on sidebar that could change column count
+    css = css.replace(
+        /(\.rb-resume--ai-generated\s+\.rb-resume__body\s*\{[^}]*)grid-template-columns\s*:[^;]+;/gi,
+        '$1grid-template-columns: 210px 1fr;'
+    );
+
+    // 8. Append a safety block that enforces critical layout rules
+    css += `
+
+/* ── Safety overrides — prevent layout breakage ── */
+.rb-resume--ai-generated .rb-resume__body {
+    display: grid !important;
+    grid-template-columns: 210px 1fr !important;
+    overflow: visible !important;
+}
+
+.rb-resume--ai-generated .rb-resume__sidebar {
+    display: flex !important;
+    flex-direction: column !important;
+    position: relative !important;
+    overflow: visible !important;
+    height: auto !important;
+}
+
+.rb-resume--ai-generated .rb-resume__main {
+    display: flex !important;
+    flex-direction: column !important;
+    position: relative !important;
+    overflow: visible !important;
+    height: auto !important;
+}
+
+.rb-resume--ai-generated .rb-resume__section {
+    position: relative !important;
+    overflow: visible !important;
+    height: auto !important;
+    float: none !important;
+    display: block !important;
+}
+
+.rb-resume--ai-generated .rb-summary {
+    position: relative !important;
+    overflow: visible !important;
+    height: auto !important;
+    word-break: break-word !important;
+    overflow-wrap: break-word !important;
+}
+
+.rb-resume--ai-generated .rb-skills {
+    display: flex !important;
+    flex-wrap: wrap !important;
+    position: relative !important;
+    height: auto !important;
+    overflow: visible !important;
+}
+`;
+
+    return css;
+}
+
+
 // POST /generate-template
 // Generates AI CSS — now supports optional inspiration image via base64
 // ═════════════════════════════════════════════════════════════════════════════
@@ -573,6 +665,9 @@ ${inspirationStyleSignals ? '2. Incorporates the style signals from the inspirat
             .replace(/^```(?:css)?\s*/i, '')
             .replace(/\s*```\s*$/,       '')
             .trim();
+
+        // Sanitize AI CSS — strips dangerous layout properties that cause overlap
+        css = sanitizeAiCss(css);
 
         res.json({ css });
 
