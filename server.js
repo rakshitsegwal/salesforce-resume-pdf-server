@@ -1,20 +1,31 @@
-const rateLimit = require('express-rate-limit');
-const helmet    = require('helmet');
-const OpenAI    = require('openai');
-const express   = require('express');
-const cors      = require('cors');
-const puppeteer = require('puppeteer');
+const rateLimit  = require('express-rate-limit');
+const helmet     = require('helmet');
+const OpenAI     = require('openai');
+const express    = require('express');
+const cors       = require('cors');
+const puppeteer  = require('puppeteer');
+const jwt        = require('jsonwebtoken');
+const { Pool }   = require('pg');
+const nodemailer = require('nodemailer');
+const crypto     = require('crypto');
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const app    = express();
 app.set('trust proxy', 1);
 
+const ALLOWED_ORIGINS = [
+    'https://developwithrax-dev-ed.my.site.com',
+    process.env.FRONTEND_URL || ''
+].filter(Boolean);
+
 app.use(cors({
-    origin: [
-        'https://developwithrax-dev-ed.my.site.com'
-    ],
-    methods: ['GET', 'POST'],
-    allowedHeaders: ['Content-Type', 'x-client-id']
+    origin: (origin, cb) => {
+        if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+        cb(new Error('Not allowed by CORS'));
+    },
+    methods:      ['GET', 'POST', 'DELETE'],
+    allowedHeaders: ['Content-Type', 'x-client-id', 'Authorization'],
+    credentials:  true
 }));
 
 // Body size: 10mb handles base64 images but limits abuse headroom
@@ -56,8 +67,100 @@ app.use(
 );
 
 // ─── Version marker ───────────────────────────────────────────────────────────
-const SERVER_VERSION = 'v8-css-fix-2026';
+const SERVER_VERSION = 'v9-auth-2026';
 const BOOT_TIME      = Date.now();
+
+// ─── Auth config ──────────────────────────────────────────────────────────────
+const JWT_SECRET     = process.env.JWT_SECRET     || 'CHANGE_ME_32_CHAR_RANDOM_SECRET';
+const JWT_EXPIRES    = '30d';
+const FRONTEND_URL   = process.env.FRONTEND_URL   || 'https://developwithrax-dev-ed.my.site.com';
+const APP_URL        = process.env.APP_URL         || 'https://salesforce-resume-pdf-server-production.up.railway.app';
+const GOOGLE_ID      = process.env.GOOGLE_CLIENT_ID     || '';
+const GOOGLE_SECRET  = process.env.GOOGLE_CLIENT_SECRET || '';
+const LINKEDIN_ID    = process.env.LINKEDIN_CLIENT_ID   || '';
+const LINKEDIN_SEC   = process.env.LINKEDIN_CLIENT_SECRET || '';
+
+// ─── PostgreSQL pool ──────────────────────────────────────────────────────────
+let db = null;
+if (process.env.DATABASE_URL) {
+    db = new Pool({
+        connectionString: process.env.DATABASE_URL,
+        ssl: { rejectUnauthorized: false },
+        max: 10,
+        idleTimeoutMillis: 30000,
+        connectionTimeoutMillis: 5000
+    });
+    db.query(`
+        CREATE EXTENSION IF NOT EXISTS pgcrypto;
+        CREATE TABLE IF NOT EXISTS rn_users (
+            id                  UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+            email               VARCHAR(255) UNIQUE NOT NULL,
+            name                VARCHAR(255),
+            provider            VARCHAR(50)  NOT NULL,
+            provider_user_id    VARCHAR(255),
+            avatar_url          TEXT,
+            plan                VARCHAR(50)  DEFAULT 'free',
+            resume_count        INTEGER      DEFAULT 0,
+            ats_reports_count   INTEGER      DEFAULT 0,
+            anonymous_client_id VARCHAR(100),
+            created_at          TIMESTAMPTZ  DEFAULT NOW(),
+            last_login_at       TIMESTAMPTZ  DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_rn_users_email    ON rn_users(email);
+        CREATE INDEX IF NOT EXISTS idx_rn_users_prov     ON rn_users(provider, provider_user_id);
+        CREATE TABLE IF NOT EXISTS rn_saved_resumes (
+            id             UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+            user_id        UUID         NOT NULL REFERENCES rn_users(id) ON DELETE CASCADE,
+            name           VARCHAR(255) DEFAULT 'My Resume',
+            resume_data    JSONB        NOT NULL,
+            ai_css         TEXT,
+            template_style VARCHAR(100) DEFAULT 'sf-classic',
+            created_at     TIMESTAMPTZ  DEFAULT NOW(),
+            updated_at     TIMESTAMPTZ  DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_rn_resumes_user ON rn_saved_resumes(user_id);
+        CREATE TABLE IF NOT EXISTS rn_ats_reports (
+            id              UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+            user_id         UUID         NOT NULL REFERENCES rn_users(id) ON DELETE CASCADE,
+            resume_snapshot JSONB,
+            job_description TEXT,
+            analysis_result JSONB        NOT NULL,
+            ats_score       INTEGER,
+            jd_match_score  INTEGER,
+            created_at      TIMESTAMPTZ  DEFAULT NOW()
+        );
+        CREATE TABLE IF NOT EXISTS rn_magic_tokens (
+            id         UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+            email      VARCHAR(255) NOT NULL,
+            token      VARCHAR(255) UNIQUE NOT NULL,
+            expires_at TIMESTAMPTZ  NOT NULL,
+            used_at    TIMESTAMPTZ,
+            client_id  VARCHAR(100),
+            created_at TIMESTAMPTZ  DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_rn_magic_token ON rn_magic_tokens(token);
+    `)
+    .then(() => console.log('[DB] Schema ready'))
+    .catch(e => console.error('[DB] Schema init:', e.message));
+} else {
+    console.warn('[DB] DATABASE_URL not set — auth disabled');
+}
+
+// ─── Email transporter ────────────────────────────────────────────────────────
+let mailer = null;
+if (process.env.RESEND_API_KEY) {
+    mailer = nodemailer.createTransport({
+        host: 'smtp.resend.com', port: 465, secure: true,
+        auth: { user: 'resend', pass: process.env.RESEND_API_KEY }
+    });
+} else if (process.env.SMTP_HOST) {
+    mailer = nodemailer.createTransport({
+        host: process.env.SMTP_HOST,
+        port: parseInt(process.env.SMTP_PORT || '587'),
+        secure: process.env.SMTP_SECURE === 'true',
+        auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
+    });
+}
 
 // ─── IP-based rate limiters (first line of defence) ─────────────────────────
 const aiLimiter = rateLimit({
@@ -121,6 +224,9 @@ app.use('/improve-summary',     aiLimiter);
 app.use('/generate-pdf',        exportLimiter);
 app.use('/analyze-job-match',   aiLimiter);
 app.use('/optimize-for-job',    aiLimiter);
+app.use('/analyze-food',        aiLimiter);
+app.use('/analyze-food',        validateClientSession);
+app.use('/analyze-food',        perClientIdLimiter);
 
 // Session validation (must come before per-clientId limiter)
 app.use('/generate-template',   validateClientSession);
@@ -1069,6 +1175,372 @@ Return ONLY this JSON:
     } catch (err) {
         console.error('/optimize-for-job error:', err);
         res.status(500).json({ error: 'Resume optimisation failed. Please try again.' });
+    }
+});
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  AUTH  —  Google OAuth · LinkedIn OAuth · Email Magic Link
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function dbRequired(res) {
+    if (!db) { res.status(503).json({ error: 'Auth not configured (no DATABASE_URL).' }); return false; }
+    return true;
+}
+
+function signToken(user) {
+    return jwt.sign(
+        { id: user.id, email: user.email, name: user.name, plan: user.plan || 'free' },
+        JWT_SECRET,
+        { expiresIn: JWT_EXPIRES }
+    );
+}
+
+function requireAuth(req, res, next) {
+    const header = req.headers['authorization'] || '';
+    const token  = header.startsWith('Bearer ') ? header.slice(7) : null;
+    if (!token) return res.status(401).json({ error: 'Authentication required.' });
+    try { req.user = jwt.verify(token, JWT_SECRET); next(); }
+    catch (_) { res.status(401).json({ error: 'Session expired. Please log in again.' }); }
+}
+
+async function upsertUser({ email, name, provider, providerUserId, avatarUrl, anonClientId }) {
+    const existing = await db.query(
+        `SELECT * FROM rn_users WHERE (provider=$1 AND provider_user_id=$2) OR email=$3 LIMIT 1`,
+        [provider, providerUserId || '', email]
+    );
+    if (existing.rows.length) {
+        const u = existing.rows[0];
+        await db.query(
+            `UPDATE rn_users SET name=$1, avatar_url=$2, last_login_at=NOW(),
+             anonymous_client_id=COALESCE(anonymous_client_id,$3) WHERE id=$4`,
+            [name || u.name, avatarUrl || u.avatar_url, anonClientId || null, u.id]
+        );
+        return { ...u, name: name || u.name, avatar_url: avatarUrl || u.avatar_url };
+    }
+    const r = await db.query(
+        `INSERT INTO rn_users(email,name,provider,provider_user_id,avatar_url,anonymous_client_id)
+         VALUES($1,$2,$3,$4,$5,$6) RETURNING *`,
+        [email, name, provider, providerUserId || null, avatarUrl || null, anonClientId || null]
+    );
+    return r.rows[0];
+}
+
+// Returns HTML page rendered inside the OAuth popup that posts the token back
+// to the parent LWC window and self-closes.
+function authSuccessPage(token, user) {
+    const safe = JSON.stringify({
+        id: user.id, email: user.email, name: user.name,
+        avatarUrl: user.avatar_url, plan: user.plan || 'free'
+    }).replace(/</g, '\\u003c').replace(/>/g, '\\u003e');
+    return `<!DOCTYPE html><html><head><title>Signing in…</title>
+<style>*{margin:0}body{font-family:system-ui,sans-serif;background:#0b0c1a;color:#fff;height:100vh;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:14px}
+.ring{width:40px;height:40px;border:3px solid #7c3aed;border-top-color:transparent;border-radius:50%;animation:s .8s linear infinite}@keyframes s{to{transform:rotate(360deg)}}</style></head>
+<body><div class="ring"></div><p style="font-size:14px;color:rgba(255,255,255,0.5)">Signing you in…</p>
+<script>
+(function(){
+  try{ window.opener && window.opener.postMessage({type:'RENONYM_AUTH_SUCCESS',token:'TOKEN',user:USER},'FRONTEND'); }catch(e){}
+  setTimeout(function(){try{window.close();}catch(e){}},400);
+})();
+</script></body></html>`\
+        .replace('TOKEN', token)\
+        .replace('USER', safe)\
+        .replace('FRONTEND', FRONTEND_URL);
+}
+
+function authErrorPage(msg) {
+    const safe = msg.replace(/'/g, "\\'").replace(/</g, '&lt;');
+    return `<!DOCTYPE html><html><head><title>Sign-in error</title>
+<style>body{font-family:system-ui,sans-serif;background:#0b0c1a;color:#ef4444;height:100vh;display:flex;align-items:center;justify-content:center;font-size:14px;}</style>
+</head><body><p>${safe}</p>
+<script>
+try{window.opener&&window.opener.postMessage({type:'RENONYM_AUTH_ERROR',error:'${safe}'},'FRONTEND');}catch(e){}
+setTimeout(function(){try{window.close();}catch(e){}},3000);
+</script></body></html>`.replace(/FRONTEND/g, FRONTEND_URL);
+}
+
+// ─── Google OAuth ──────────────────────────────────────────────────────────────
+
+app.get('/auth/google', (req, res) => {
+    if (!GOOGLE_ID) return res.send(authErrorPage('Google OAuth not configured on server.'));
+    const state  = Buffer.from(JSON.stringify({ cid: req.query.cid || '', ts: Date.now() })).toString('base64url');
+    const params = new URLSearchParams({
+        client_id: GOOGLE_ID,
+        redirect_uri: APP_URL + '/auth/google/callback',
+        response_type: 'code', scope: 'openid email profile',
+        state, access_type: 'offline', prompt: 'select_account'
+    });
+    res.redirect('https://accounts.google.com/o/oauth2/v2/auth?' + params);
+});
+
+app.get('/auth/google/callback', async (req, res) => {
+    if (!dbRequired(res)) return;
+    const { code, state, error } = req.query;
+    if (error || !code) return res.send(authErrorPage('Google sign-in was cancelled.'));
+    let anonClientId = '';
+    try { anonClientId = JSON.parse(Buffer.from(state||'','base64url').toString()).cid || ''; } catch(_){}
+    try {
+        const tokRes = await fetch('https://oauth2.googleapis.com/token', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({ code, client_id: GOOGLE_ID, client_secret: GOOGLE_SECRET,
+                redirect_uri: APP_URL + '/auth/google/callback', grant_type: 'authorization_code' }).toString()
+        });
+        const tokData = await tokRes.json();
+        if (!tokData.access_token) throw new Error('No access_token from Google');
+
+        const profRes  = await fetch('https://www.googleapis.com/oauth2/v3/userinfo',
+            { headers: { Authorization: 'Bearer ' + tokData.access_token } });
+        const profile  = await profRes.json();
+        if (!profile.email) throw new Error('No email returned from Google');
+
+        const user  = await upsertUser({ email: profile.email,
+            name: profile.name || profile.email.split('@')[0],
+            provider: 'google', providerUserId: profile.sub,
+            avatarUrl: profile.picture, anonClientId });
+        const token = signToken(user);
+        console.log('[AUTH] Google login:', user.email);
+        res.send(authSuccessPage(token, user));
+    } catch (e) {
+        console.error('[AUTH] Google callback error:', e.message);
+        res.send(authErrorPage('Google sign-in failed. Please try again.'));
+    }
+});
+
+// ─── LinkedIn OAuth ────────────────────────────────────────────────────────────
+
+app.get('/auth/linkedin', (req, res) => {
+    if (!LINKEDIN_ID) return res.send(authErrorPage('LinkedIn OAuth not configured on server.'));
+    const state  = Buffer.from(JSON.stringify({ cid: req.query.cid || '', ts: Date.now() })).toString('base64url');
+    const params = new URLSearchParams({
+        response_type: 'code', client_id: LINKEDIN_ID,
+        redirect_uri: APP_URL + '/auth/linkedin/callback',
+        state, scope: 'openid profile email'
+    });
+    res.redirect('https://www.linkedin.com/oauth/v2/authorization?' + params);
+});
+
+app.get('/auth/linkedin/callback', async (req, res) => {
+    if (!dbRequired(res)) return;
+    const { code, state, error } = req.query;
+    if (error || !code) return res.send(authErrorPage('LinkedIn sign-in was cancelled.'));
+    let anonClientId = '';
+    try { anonClientId = JSON.parse(Buffer.from(state||'','base64url').toString()).cid || ''; } catch(_){}
+    try {
+        const tokRes = await fetch('https://www.linkedin.com/oauth/v2/accessToken', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({ grant_type: 'authorization_code', code,
+                redirect_uri: APP_URL + '/auth/linkedin/callback',
+                client_id: LINKEDIN_ID, client_secret: LINKEDIN_SEC }).toString()
+        });
+        const tokData = await tokRes.json();
+        if (!tokData.access_token) throw new Error('No access_token from LinkedIn');
+
+        const profRes  = await fetch('https://api.linkedin.com/v2/userinfo',
+            { headers: { Authorization: 'Bearer ' + tokData.access_token } });
+        const profile  = await profRes.json();
+
+        const firstName = profile.given_name  || '';
+        const lastName  = profile.family_name || '';
+        const fullName  = (firstName + ' ' + lastName).trim() || profile.name || 'LinkedIn User';
+        const email     = profile.email || profile.sub + '@linkedin.placeholder';
+
+        const user  = await upsertUser({ email, name: fullName, provider: 'linkedin',
+            providerUserId: profile.sub, avatarUrl: profile.picture || null, anonClientId });
+        const token = signToken(user);
+        console.log('[AUTH] LinkedIn login:', user.email);
+        res.send(authSuccessPage(token, user));
+    } catch (e) {
+        console.error('[AUTH] LinkedIn callback error:', e.message);
+        res.send(authErrorPage('LinkedIn sign-in failed. Please try again.'));
+    }
+});
+
+// ─── Magic Link ────────────────────────────────────────────────────────────────
+
+app.post('/auth/magic-link/request', async (req, res) => {
+    if (!dbRequired(res)) return;
+    const { email, clientId } = req.body;
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
+        return res.status(400).json({ error: 'Please enter a valid email address.' });
+    if (!mailer)
+        return res.status(503).json({ error: 'Email not configured on server. Use Google or LinkedIn.' });
+    try {
+        const rawToken  = crypto.randomBytes(32).toString('hex');
+        const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
+        await db.query('DELETE FROM rn_magic_tokens WHERE email=$1 AND used_at IS NULL', [email]);
+        await db.query(
+            'INSERT INTO rn_magic_tokens(email,token,expires_at,client_id) VALUES($1,$2,$3,$4)',
+            [email, rawToken, expiresAt, clientId || null]
+        );
+        const link = `${APP_URL}/auth/magic-link/verify?token=${rawToken}`;
+        await mailer.sendMail({
+            from: process.env.SMTP_FROM || 'noreply@renonym.ai',
+            to: email,
+            subject: 'Your Renonym AI sign-in link',
+            html: `<div style="font-family:system-ui,sans-serif;max-width:480px;margin:0 auto;padding:32px 24px;">
+<div style="background:#0b0c1a;border-radius:16px;padding:32px;text-align:center;">
+<div style="font-size:28px;font-weight:900;color:#f0f0f8;letter-spacing:-0.04em;margin-bottom:6px;">Renonym AI</div>
+<p style="color:rgba(255,255,255,0.5);font-size:13px;margin:0 0 28px">AI-Powered Resume Builder</p>
+<p style="color:#f0f0f8;font-size:15px;line-height:1.6;margin:0 0 24px">
+  Click the button below to sign in.<br/>This link expires in <strong>15 minutes</strong>.
+</p>
+<a href="${link}" style="display:inline-block;background:linear-gradient(135deg,#7c3aed,#9333ea);color:#fff;text-decoration:none;padding:14px 36px;border-radius:10px;font-weight:700;font-size:15px;">
+  Sign in to Renonym AI
+</a>
+<p style="margin-top:24px;font-size:11px;color:rgba(255,255,255,0.25);">
+  If you didn't request this, you can safely ignore it.
+</p></div></div>`
+        });
+        console.log('[AUTH] Magic link sent to:', email);
+        res.json({ success: true });
+    } catch (e) {
+        console.error('[AUTH] Magic link error:', e.message);
+        res.status(500).json({ error: 'Failed to send email. Please try again.' });
+    }
+});
+
+app.get('/auth/magic-link/verify', async (req, res) => {
+    if (!dbRequired(res)) return;
+    const { token } = req.query;
+    if (!token) return res.send(authErrorPage('Invalid magic link.'));
+    try {
+        const r = await db.query(
+            'SELECT * FROM rn_magic_tokens WHERE token=$1 AND used_at IS NULL AND expires_at>NOW()',
+            [token]
+        );
+        if (!r.rows.length) return res.send(authErrorPage('This link has expired or already been used. Please request a new one.'));
+        const link = r.rows[0];
+        await db.query('UPDATE rn_magic_tokens SET used_at=NOW() WHERE id=$1', [link.id]);
+        const user  = await upsertUser({ email: link.email,
+            name: link.email.split('@')[0], provider: 'email',
+            providerUserId: null, avatarUrl: null, anonClientId: link.client_id });
+        const jwtToken = signToken(user);
+        console.log('[AUTH] Magic link login:', user.email);
+        res.send(authSuccessPage(jwtToken, user));
+    } catch (e) {
+        console.error('[AUTH] Magic link verify error:', e.message);
+        res.send(authErrorPage('Sign-in failed. Please try again.'));
+    }
+});
+
+// ─── Session endpoints ─────────────────────────────────────────────────────────
+
+app.get('/auth/me', requireAuth, async (req, res) => {
+    if (!dbRequired(res)) return;
+    try {
+        const r = await db.query('SELECT * FROM rn_users WHERE id=$1', [req.user.id]);
+        if (!r.rows.length) return res.status(404).json({ error: 'User not found.' });
+        const u = r.rows[0];
+        res.json({ id:u.id, email:u.email, name:u.name, avatarUrl:u.avatar_url,
+            plan:u.plan, resumeCount:u.resume_count, atsCount:u.ats_reports_count,
+            createdAt:u.created_at, lastLoginAt:u.last_login_at });
+    } catch (e) { res.status(500).json({ error: 'Failed to load profile.' }); }
+});
+
+app.post('/auth/logout', requireAuth, (req, res) => {
+    console.log('[AUTH] Logout:', req.user.email);
+    res.json({ success: true });
+});
+
+// ─── Save Resume (requires auth) ──────────────────────────────────────────────
+
+app.post('/auth/save-resume', requireAuth, async (req, res) => {
+    if (!dbRequired(res)) return;
+    const { resumeData, aiCss, templateStyle, name, resumeId } = req.body;
+    if (!resumeData) return res.status(400).json({ error: 'No resume data provided.' });
+    try {
+        let r;
+        if (resumeId) {
+            r = await db.query(
+                `UPDATE rn_saved_resumes SET resume_data=$1,ai_css=$2,template_style=$3,name=$4,updated_at=NOW()
+                 WHERE id=$5 AND user_id=$6 RETURNING *`,
+                [resumeData, aiCss||null, templateStyle||'sf-classic', name||'My Resume', resumeId, req.user.id]
+            );
+        } else {
+            r = await db.query(
+                `INSERT INTO rn_saved_resumes(user_id,resume_data,ai_css,template_style,name)
+                 VALUES($1,$2,$3,$4,$5) RETURNING *`,
+                [req.user.id, resumeData, aiCss||null, templateStyle||'sf-classic', name||'My Resume']
+            );
+            await db.query('UPDATE rn_users SET resume_count=resume_count+1 WHERE id=$1', [req.user.id]);
+        }
+        res.json({ success:true, resume: r.rows[0] });
+    } catch (e) {
+        console.error('/auth/save-resume error:', e.message);
+        res.status(500).json({ error: 'Failed to save resume.' });
+    }
+});
+
+app.get('/auth/resumes', requireAuth, async (req, res) => {
+    if (!dbRequired(res)) return;
+    try {
+        const r = await db.query(
+            'SELECT id,name,template_style,created_at,updated_at FROM rn_saved_resumes WHERE user_id=$1 ORDER BY updated_at DESC',
+            [req.user.id]
+        );
+        res.json({ resumes: r.rows });
+    } catch (e) { res.status(500).json({ error: 'Failed to load resumes.' }); }
+});
+
+app.post('/auth/save-ats-report', requireAuth, async (req, res) => {
+    if (!dbRequired(res)) return;
+    const { resumeSnapshot, jobDescription, analysisResult } = req.body;
+    if (!analysisResult) return res.status(400).json({ error: 'No analysis data.' });
+    try {
+        await db.query(
+            `INSERT INTO rn_ats_reports(user_id,resume_snapshot,job_description,analysis_result,ats_score,jd_match_score)
+             VALUES($1,$2,$3,$4,$5,$6)`,
+            [req.user.id, resumeSnapshot||null, jobDescription||null, analysisResult,
+             analysisResult.atsScore||null, analysisResult.jdMatch||null]
+        );
+        await db.query('UPDATE rn_users SET ats_reports_count=ats_reports_count+1 WHERE id=$1', [req.user.id]);
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: 'Failed to save ATS report.' }); }
+});
+
+// ─── Calorie Calculator ────────────────────────────────────────────────────────
+
+app.post('/analyze-food', async (req, res) => {
+    try {
+        const { imageBase64, mimeType } = req.body;
+        if (!imageBase64 || imageBase64.length < 100)
+            return res.status(400).json({ error: 'No image provided.' });
+        if (imageBase64.length > 10_000_000)
+            return res.status(400).json({ error: 'Image too large. Maximum 6 MB.' });
+        const validMime = ['image/jpeg','image/jpg','image/png','image/webp','image/heic','image/gif'];
+        const mime = (mimeType || 'image/jpeg').toLowerCase();
+        if (!validMime.includes(mime))
+            return res.status(400).json({ error: 'Unsupported image type.' });
+
+        const completion = await openai.chat.completions.create({
+            model: 'gpt-4o',
+            max_tokens: 1000,
+            messages: [{
+                role: 'user',
+                content: [
+                    { type: 'image_url', image_url: { url: `data:${mime};base64,${imageBase64}`, detail: 'high' } },
+                    { type: 'text', text: `You are a professional nutritionist. Analyse this food image.
+Return ONLY valid JSON, no markdown:
+{"items":[{"name":"<food name>","portion":"<e.g. 150g>","calories":<int>,"protein":<int>,"carbs":<int>,"fat":<int>}],
+"totalCalories":<int>,"totalProtein":<int>,"totalCarbs":<int>,"totalFat":<int>,
+"confidence":"high"|"medium"|"low","notes":"<under 80 words>"}
+If no food visible: {"error":"No food detected."}` }
+                ]
+            }],
+            response_format: { type: 'json_object' }
+        });
+
+        const result = JSON.parse(completion.choices[0].message.content);
+        if (result.error) return res.status(400).json({ error: result.error });
+        if (result.totalCalories > 5000) result.totalCalories = 5000;
+        res.json(result);
+    } catch (e) {
+        console.error('/analyze-food error:', e.message);
+        res.status(500).json({ error: 'Food analysis failed. Please try again.' });
     }
 });
 
