@@ -1244,9 +1244,9 @@ function authSuccessPage(token, user) {
   try{ window.opener && window.opener.postMessage({type:'RENONYM_AUTH_SUCCESS',token:'TOKEN',user:USER},'FRONTEND'); }catch(e){}
   setTimeout(function(){try{window.close();}catch(e){}},400);
 })();
-</script></body></html>`
-        .replace('TOKEN', token)
-        .replace('USER', safe)
+</script></body></html>`\
+        .replace('TOKEN', token)\
+        .replace('USER', safe)\
         .replace('FRONTEND', FRONTEND_URL);
 }
 
@@ -1265,7 +1265,7 @@ setTimeout(function(){try{window.close();}catch(e){}},3000);
 
 app.get('/auth/google', (req, res) => {
     if (!GOOGLE_ID) return res.send(authErrorPage('Google OAuth not configured on server.'));
-    const state  = Buffer.from(JSON.stringify({ cid: req.query.cid || '', ts: Date.now() })).toString('base64url');
+    const state  = Buffer.from(JSON.stringify({ cid: req.query.cid || '', nonce: req.query.nonce || '', ts: Date.now() })).toString('base64url');
     const params = new URLSearchParams({
         client_id: GOOGLE_ID,
         redirect_uri: APP_URL + '/auth/google/callback',
@@ -1279,8 +1279,8 @@ app.get('/auth/google/callback', async (req, res) => {
     if (!dbRequired(res)) return;
     const { code, state, error } = req.query;
     if (error || !code) return res.send(authErrorPage('Google sign-in was cancelled.'));
-    let anonClientId = '';
-    try { anonClientId = JSON.parse(Buffer.from(state||'','base64url').toString()).cid || ''; } catch(_){}
+    let anonClientId = '', stateData = {};
+    try { stateData = JSON.parse(Buffer.from(state||'','base64url').toString()); anonClientId = stateData.cid || ''; } catch(_){}
     try {
         const tokRes = await fetch('https://oauth2.googleapis.com/token', {
             method: 'POST',
@@ -1301,8 +1301,13 @@ app.get('/auth/google/callback', async (req, res) => {
             provider: 'google', providerUserId: profile.sub,
             avatarUrl: profile.picture, anonClientId });
         const token = signToken(user);
+        const safeUser = { id:user.id, email:user.email, name:user.name, avatarUrl:user.avatar_url, plan:user.plan||'free' };
+        // Store in polling map so LWC can pick it up
+        if (stateData && stateData.nonce && pendingAuthSessions.has(stateData.nonce)) {
+            pendingAuthSessions.set(stateData.nonce, { token, user: safeUser, createdAt: Date.now() });
+        }
         console.log('[AUTH] Google login:', user.email);
-        res.send(authSuccessPage(token, user));
+        res.send(authSuccessPage(token, safeUser));
     } catch (e) {
         console.error('[AUTH] Google callback error:', e.message);
         res.send(authErrorPage('Google sign-in failed. Please try again.'));
@@ -1313,7 +1318,7 @@ app.get('/auth/google/callback', async (req, res) => {
 
 app.get('/auth/linkedin', (req, res) => {
     if (!LINKEDIN_ID) return res.send(authErrorPage('LinkedIn OAuth not configured on server.'));
-    const state  = Buffer.from(JSON.stringify({ cid: req.query.cid || '', ts: Date.now() })).toString('base64url');
+    const state  = Buffer.from(JSON.stringify({ cid: req.query.cid || '', nonce: req.query.nonce || '', ts: Date.now() })).toString('base64url');
     const params = new URLSearchParams({
         response_type: 'code', client_id: LINKEDIN_ID,
         redirect_uri: APP_URL + '/auth/linkedin/callback',
@@ -1326,8 +1331,8 @@ app.get('/auth/linkedin/callback', async (req, res) => {
     if (!dbRequired(res)) return;
     const { code, state, error } = req.query;
     if (error || !code) return res.send(authErrorPage('LinkedIn sign-in was cancelled.'));
-    let anonClientId = '';
-    try { anonClientId = JSON.parse(Buffer.from(state||'','base64url').toString()).cid || ''; } catch(_){}
+    let anonClientId = '', stateData = {};
+    try { stateData = JSON.parse(Buffer.from(state||'','base64url').toString()); anonClientId = stateData.cid || ''; } catch(_){}
     try {
         const tokRes = await fetch('https://www.linkedin.com/oauth/v2/accessToken', {
             method: 'POST',
@@ -1419,8 +1424,12 @@ app.get('/auth/magic-link/verify', async (req, res) => {
             name: link.email.split('@')[0], provider: 'email',
             providerUserId: null, avatarUrl: null, anonClientId: link.client_id });
         const jwtToken = signToken(user);
+        const safeUser = { id:user.id, email:user.email, name:user.name, avatarUrl:user.avatar_url, plan:user.plan||'free' };
+        if (link.client_id && pendingAuthSessions.has(link.client_id + '_ml')) {
+            pendingAuthSessions.set(link.client_id + '_ml', { token: jwtToken, user: safeUser, createdAt: Date.now() });
+        }
         console.log('[AUTH] Magic link login:', user.email);
-        res.send(authSuccessPage(jwtToken, user));
+        res.send(authSuccessPage(jwtToken, safeUser));
     } catch (e) {
         console.error('[AUTH] Magic link verify error:', e.message);
         res.send(authErrorPage('Sign-in failed. Please try again.'));
@@ -1439,6 +1448,44 @@ app.get('/auth/me', requireAuth, async (req, res) => {
             plan:u.plan, resumeCount:u.resume_count, atsCount:u.ats_reports_count,
             createdAt:u.created_at, lastLoginAt:u.last_login_at });
     } catch (e) { res.status(500).json({ error: 'Failed to load profile.' }); }
+});
+
+
+// ─── Auth polling — LWC Locker Service safe alternative to postMessage ────────
+// LWC cannot use window.addEventListener('message') due to Locker Service.
+// Instead: LWC polls this endpoint every 1.5s after opening the OAuth popup.
+// Flow: LWC calls /auth/init-poll → gets nonce → opens popup with nonce
+//       → server stores JWT by nonce after OAuth → LWC polls /auth/poll?nonce
+//       → returns JWT when ready → LWC stores token and updates state
+
+const pendingAuthSessions = new Map(); // nonce → { token, user } or null
+
+// Clean up stale nonces every 5 minutes
+setInterval(() => {
+    const cutoff = Date.now() - 5 * 60 * 1000;
+    for (const [nonce, val] of pendingAuthSessions.entries()) {
+        if (val && val.createdAt < cutoff) pendingAuthSessions.delete(nonce);
+        else if (!val && typeof val !== 'object') pendingAuthSessions.delete(nonce);
+    }
+}, 5 * 60 * 1000);
+
+app.post('/auth/init-poll', (req, res) => {
+    const nonce = require('crypto').randomBytes(16).toString('hex');
+    pendingAuthSessions.set(nonce, null); // null = pending
+    // auto-expire after 5 min
+    setTimeout(() => pendingAuthSessions.delete(nonce), 5 * 60 * 1000);
+    res.json({ nonce });
+});
+
+app.get('/auth/poll', (req, res) => {
+    const { nonce } = req.query;
+    if (!nonce || !pendingAuthSessions.has(nonce)) {
+        return res.status(404).json({ error: 'Invalid or expired nonce.' });
+    }
+    const session = pendingAuthSessions.get(nonce);
+    if (!session) return res.json({ pending: true });   // still waiting
+    pendingAuthSessions.delete(nonce);
+    res.json({ pending: false, token: session.token, user: session.user });
 });
 
 app.post('/auth/logout', requireAuth, (req, res) => {
