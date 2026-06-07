@@ -506,89 +506,208 @@ ${text}`;
 // ═════════════════════════════════════════════════════════════════════════════
 
 // ─── AI CSS sanitizer ─────────────────────────────────────────────────────────
-// Strips properties that break the sidebar layout. Called on every AI-generated
-// CSS string before it is returned to the client.
+// Comprehensively strips any property that can break layout.
+// Three-pass approach: strip dangerous values → fix column constraints → append hard overrides.
 function sanitizeAiCss(css) {
     if (!css) return '';
 
-    // 1. Remove absolute/fixed positioning — causes section overlap
-    css = css.replace(/position\s*:\s*(absolute|fixed)\s*(!important)?\s*;/gi, 'position: relative;');
+    // ── Pass 1: Strip unconditionally dangerous values (anywhere in the CSS) ──
 
-    // 2. Remove negative margins — causes sections to overlap each other
+    // position: absolute / fixed → relative (causes overlap everywhere)
+    css = css.replace(/position\s*:\s*(absolute|fixed)\s*(!important)?\s*;/gi,
+        'position: relative;');
+
+    // overflow: hidden / clip → visible (clips sidebar content from ANY element)
+    css = css.replace(/overflow(-[xy])?\s*:\s*(hidden|clip)\s*(!important)?\s*;/gi,
+        function(m, axis) { return 'overflow' + (axis||'') + ': visible;'; });
+
+    // display: none (accidentally hides sections)
+    css = css.replace(/display\s*:\s*none\s*(!important)?\s*;/gi, '');
+
+    // float: left / right (breaks grid layout entirely)
+    css = css.replace(/float\s*:\s*(left|right)\s*(!important)?\s*;/gi, '');
+
+    // negative margins (causes sections to overlap)
     css = css.replace(/margin(-top|-bottom|-left|-right)?\s*:\s*-[\d.]+[a-z%]*\s*(!important)?\s*;/gi, '');
 
-    // 3. Remove overflow:hidden on structural containers — clips content
+    // negative z-index (elements disappear behind others)
+    css = css.replace(/z-index\s*:\s*-[\d]+\s*(!important)?\s*;/gi, 'z-index: 0;');
+
+    // transform: translate with negative values (moves content off-screen)
+    css = css.replace(/transform\s*:[^;]*translate[^;]*-[\d][^;]*;/gi, '');
+
+    // ── Pass 2: Protect structural sizing constraints ──────────────────────
+
+    // Strip grid-template-columns overrides on the body (preserve 2-col layout)
     css = css.replace(
-        /(\.rb-resume--ai-generated(?:\s+\.rb-resume__(?:sidebar|main|body|section|header))?\s*\{[^}]*?)overflow\s*:\s*hidden\s*(!important)?\s*;/gi,
-        '$1overflow: visible;'
+        /(\.rb-resume--ai-generated[^{]*\.rb-resume__body[^{]*\{[^}]*)grid-template-columns\s*:[^;]+;/gi,
+        '$1/* grid-template-columns locked to 210px 1fr */'
     );
 
-    // 4. Remove height on sidebar/sections — fixed heights clip content
+    // Strip width overrides on sidebar/main (let grid control sizing)
     css = css.replace(
-        /(\.rb-resume--ai-generated(?:\s+\.rb-resume__(?:sidebar|section))?\s*\{[^}]*)\bheight\s*:\s*[\d.]+[a-z%]+\s*(!important)?\s*;/gi,
+        /(\.rb-resume--ai-generated[^{]*(?:sidebar|main)[^{]*\{[^}]*)\bwidth\s*:\s*[\d.]+[a-z%]+\s*(!important)?\s*;/gi,
+        '$1/* width locked by grid */'
+    );
+
+    // Strip fixed pixel heights on structural containers (content is clipped)
+    css = css.replace(
+        /(\.rb-resume--ai-generated[^{]*(?:sidebar|main|body|section|summary|header)[^{]*\{[^}]*)\bheight\s*:\s*[\d.]+[a-z%]+\s*(!important)?\s*;/gi,
         '$1min-height: 0;'
     );
 
-    // 5. Remove float — breaks grid layout
-    css = css.replace(/float\s*:\s*(left|right)\s*(!important)?\s*;/gi, '');
-
-    // 6. Remove display:none — hides content accidentally
-    css = css.replace(/display\s*:\s*none\s*(!important)?\s*;/gi, '');
-
-    // 7. Remove grid/flex on sidebar that could change column count
+    // Cap extreme padding (max 32px per side prevents blowout)
     css = css.replace(
-        /(\.rb-resume--ai-generated\s+\.rb-resume__body\s*\{[^}]*)grid-template-columns\s*:[^;]+;/gi,
-        '$1grid-template-columns: 210px 1fr;'
+        /\bpadding(-top|-bottom|-left|-right)?\s*:\s*([\d]+)px\s*(!important)?\s*;/gi,
+        function(m, side, val, imp) {
+            return parseInt(val, 10) > 32
+                ? 'padding' + (side||'') + ': 32px;'
+                : m;
+        }
     );
 
-    // 8. Append a safety block that enforces critical layout rules
+    // Cap extreme font sizes to prevent blowout (max 24px body, 32px heading)
+    css = css.replace(
+        /\bfont-size\s*:\s*([\d]+)px\s*(!important)?\s*;/gi,
+        function(m, val, imp) {
+            return parseInt(val, 10) > 32 ? 'font-size: 14px;' : m;
+        }
+    );
+
+    // ── Pass 3: Append hard layout safety overrides (highest specificity) ──
     css += `
 
-/* ── Safety overrides — prevent layout breakage ── */
+/* ══ LAYOUT SAFETY OVERRIDES — injected by Renonym AI sanitizer ══
+   These run LAST and use !important to guarantee the resume
+   never breaks no matter what the AI generated above. */
+
+/* Root — visible overflow so nothing clips */
+.rb-resume--ai-generated {
+    overflow: visible !important;
+    box-sizing: border-box !important;
+}
+
+/* 2-col grid — locked. AI cannot change this. */
 .rb-resume--ai-generated .rb-resume__body {
     display: grid !important;
     grid-template-columns: 210px 1fr !important;
     overflow: visible !important;
+    position: relative !important;
+    width: 100% !important;
 }
 
+/* Sidebar — flex column, never absolute, never floated */
 .rb-resume--ai-generated .rb-resume__sidebar {
     display: flex !important;
     flex-direction: column !important;
+    gap: 0 !important;
     position: relative !important;
+    float: none !important;
     overflow: visible !important;
     height: auto !important;
+    min-height: 0 !important;
+    width: auto !important;
+    box-sizing: border-box !important;
 }
 
+/* Main column — same guarantees */
 .rb-resume--ai-generated .rb-resume__main {
     display: flex !important;
     flex-direction: column !important;
     position: relative !important;
+    float: none !important;
     overflow: visible !important;
     height: auto !important;
+    min-height: 0 !important;
+    width: auto !important;
+    box-sizing: border-box !important;
 }
 
+/* Every section stacks naturally — never overlaps */
 .rb-resume--ai-generated .rb-resume__section {
+    position: relative !important;
+    float: none !important;
+    display: block !important;
+    overflow: visible !important;
+    height: auto !important;
+    min-height: 0 !important;
+    flex-shrink: 0 !important;
+    box-sizing: border-box !important;
+    width: auto !important;
+}
+
+/* Section titles — always visible, always a block */
+.rb-resume--ai-generated .rb-section-title {
+    display: block !important;
     position: relative !important;
     overflow: visible !important;
     height: auto !important;
-    float: none !important;
-    display: block !important;
+    width: auto !important;
 }
 
-.rb-resume--ai-generated .rb-summary {
+/* Summary — wraps, never clips */
+.rb-resume--ai-generated .rb-summary,
+.rb-resume--ai-generated .rb-summary p {
     position: relative !important;
     overflow: visible !important;
     height: auto !important;
     word-break: break-word !important;
     overflow-wrap: break-word !important;
+    white-space: normal !important;
+    display: block !important;
 }
 
+/* Skills row — always wraps */
 .rb-resume--ai-generated .rb-skills {
     display: flex !important;
     flex-wrap: wrap !important;
+    height: auto !important;
+    overflow: visible !important;
+    position: relative !important;
+}
+
+/* Skill pills — inline flex, never absolute */
+.rb-resume--ai-generated .rb-skill-pill {
+    display: inline-flex !important;
     position: relative !important;
     height: auto !important;
     overflow: visible !important;
+    white-space: nowrap !important;
+    box-sizing: border-box !important;
+}
+
+/* Experience + education items — block, visible, auto height */
+.rb-resume--ai-generated .rb-exp-item,
+.rb-resume--ai-generated .rb-edu-item {
+    position: relative !important;
+    overflow: visible !important;
+    height: auto !important;
+    display: block !important;
+    float: none !important;
+    box-sizing: border-box !important;
+}
+
+/* Bullet lists — visible, auto height */
+.rb-resume--ai-generated .rb-exp-bullets,
+.rb-resume--ai-generated .rb-exp-bullets li {
+    overflow: visible !important;
+    height: auto !important;
+    position: relative !important;
+    display: list-item !important;
+}
+
+/* Contact row — wraps on overflow */
+.rb-resume--ai-generated .rb-resume__contact {
+    overflow: visible !important;
+    flex-wrap: wrap !important;
+    height: auto !important;
+}
+
+/* Header — always visible */
+.rb-resume--ai-generated .rb-resume__header {
+    overflow: visible !important;
+    position: relative !important;
+    height: auto !important;
 }
 `;
 
@@ -674,12 +793,30 @@ RULES:
 - Output ONLY raw CSS. No markdown, no code fences, no explanations.
 - ONLY use class .rb-resume--ai-generated and its descendants.
 - All selectors MUST start with .rb-resume--ai-generated
-- No absolute or fixed positioning.
-- No animations or transitions.
-- No overflow: hidden on the resume root.
-- Preserve readable font sizes (minimum 8px for body, 10px for headings).
+
+HARD CONSTRAINTS — violating ANY of these will break the resume:
+- FORBIDDEN: position: absolute or position: fixed (on ANY element)
+- FORBIDDEN: overflow: hidden or overflow: clip (on ANY element)
+- FORBIDDEN: display: none (on any element)
+- FORBIDDEN: float: left or float: right (on any element)
+- FORBIDDEN: negative margin values (any side)
+- FORBIDDEN: negative z-index values
+- FORBIDDEN: changing grid-template-columns on .rb-resume__body
+- FORBIDDEN: setting width on .rb-resume__sidebar or .rb-resume__main
+- FORBIDDEN: setting fixed pixel height on sidebar, main, body, or section
+- FORBIDDEN: padding values above 32px on any side
+- FORBIDDEN: font-size above 32px anywhere in the resume body
+
+ALLOWED — style ONLY these visual/cosmetic properties:
+- Colors: color, background-color, background (gradients OK)
+- Typography: font-family, font-size (8–24px), font-weight, letter-spacing, line-height, text-transform
+- Borders: border, border-radius, border-color, border-width, border-style
+- Spacing: padding (max 32px), margin (positive values only), gap
+- Decorative: box-shadow, opacity (never 0), text-decoration
+
+- Preserve readable font sizes (minimum 8px body, 10px headings).
 - Ensure high colour contrast for ATS scanning.
-- Keep the two-column sidebar + main layout unless explicitly asked to change it.
+- Keep the two-column sidebar + main layout intact.
 - Optimise for A4 single-page output.
 - Use web-safe fonts only: system-ui, Georgia, 'Times New Roman', 'Courier New'.
 
@@ -1244,9 +1381,9 @@ function authSuccessPage(token, user) {
   try{ window.opener && window.opener.postMessage({type:'RENONYM_AUTH_SUCCESS',token:'TOKEN',user:USER},'FRONTEND'); }catch(e){}
   setTimeout(function(){try{window.close();}catch(e){}},400);
 })();
-</script></body></html>`
-        .replace('TOKEN', token)
-        .replace('USER', safe)
+</script></body></html>`\
+        .replace('TOKEN', token)\
+        .replace('USER', safe)\
         .replace('FRONTEND', FRONTEND_URL);
 }
 
