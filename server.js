@@ -1244,9 +1244,9 @@ function authSuccessPage(token, user) {
   try{ window.opener && window.opener.postMessage({type:'RENONYM_AUTH_SUCCESS',token:'TOKEN',user:USER},'FRONTEND'); }catch(e){}
   setTimeout(function(){try{window.close();}catch(e){}},400);
 })();
-</script></body></html>`\
-        .replace('TOKEN', token)\
-        .replace('USER', safe)\
+</script></body></html>`
+        .replace('TOKEN', token)
+        .replace('USER', safe)
         .replace('FRONTEND', FRONTEND_URL);
 }
 
