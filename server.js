@@ -921,6 +921,40 @@ Return your analysis as a compact, structured paragraph of CSS-relevant design s
             }
         }
 
+        // ── Step 1.5: Classify layout from vision signals ──────────────────────
+        let detectedLayout = 'two-col'; // default
+        if (inspirationStyleSignals || prompt) {
+            try {
+                const layoutCompletion = await openai.chat.completions.create({
+                    model: 'gpt-4.1-mini',
+                    messages: [{
+                        role: 'user',
+                        content: `You are a resume layout classifier.
+
+Given this design brief and style signals:
+PROMPT: ${sanitizeInput(prompt)}
+SIGNALS: ${inspirationStyleSignals || 'none'}
+
+Classify the layout as ONE of:
+- two-col: narrow left sidebar (skills/about) + wider right column (experience/education)
+- single: single full-width column, all sections stacked
+- top-banner: full-width coloured header across the top, content below
+- asymmetric: identity/contact/skills in left accent column (35%), experience/education in wider right (65%)
+
+Reply with ONLY ONE word: two-col, single, top-banner, or asymmetric`
+                    }],
+                    max_tokens: 10,
+                    temperature: 0
+                });
+                const raw = layoutCompletion.choices[0].message.content.trim().toLowerCase();
+                if (['two-col','single','top-banner','asymmetric'].includes(raw)) {
+                    detectedLayout = raw;
+                }
+            } catch (e) {
+                // non-fatal — use default
+            }
+        }
+
         // ── Step 2: Generate CSS template ──
         const systemPrompt = `You are an elite AI resume designer. You ONLY generate CSS.
 
@@ -1951,17 +1985,17 @@ app.post('/verify-payment', async (req, res) => {
         console.log(`[${SERVER_VERSION}] Payment verified: order=${razorpay_order_id} payment=${razorpay_payment_id} plan=${planId}`);
 
         // Update DB if user is authenticated
-        if (userId && pool) {
+        if (userId && db) {
             try {
                 const expiresAt = planId.includes('yearly')
                     ? new Date(Date.now() + 365 * 24 * 60 * 60 * 1000)
                     : new Date(Date.now() + 30  * 24 * 60 * 60 * 1000);
 
-                await pool.query(
-                    `UPDATE users
-                     SET plan = 'pro', plan_expires_at = $1, updated_at = NOW()
-                     WHERE id = $2`,
-                    [expiresAt, userId]
+                await db.query(
+                    `UPDATE rn_users
+                     SET plan = 'pro', updated_at = NOW()
+                     WHERE id = $1`,
+                    [userId]
                 );
                 console.log(`[${SERVER_VERSION}] User ${userId} upgraded to pro until ${expiresAt}`);
             } catch (dbErr) {
