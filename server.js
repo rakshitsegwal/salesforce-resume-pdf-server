@@ -184,6 +184,29 @@ const exportLimiter = rateLimit({
     message: { error: 'PDF export limit reached. Please try again later.' }
 });
 
+// Payment endpoints — strict limits to prevent API probing / forged-sig attacks
+const paymentLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000,   // 1 hour
+    max: 10,                     // max 10 order creations per IP per hour
+    standardHeaders: true,
+    message: { error: 'Too many payment requests. Please try again later.' }
+});
+
+// Magic link — strict to prevent email spam abuse
+const magicLinkLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,   // 15 minutes
+    max: 5,                      // 5 magic link requests per IP per 15 min
+    standardHeaders: true,
+    message: { error: 'Too many email requests. Please wait 15 minutes.' }
+});
+
+// Auth polling — light limit to prevent nonce enumeration
+const pollLimiter = rateLimit({
+    windowMs: 5 * 60 * 1000,
+    max: 60,                     // 60 polls per 5 min (polling every 1.5s for up to 5 min = ~200 max)
+    message: { error: 'Too many poll requests.' }
+});
+
 // ─── Per-clientId rate limiter (second line of defence) ──────────────────────
 // Prevents abuse from users who rotate IPs but keep the same browser session.
 // Uses an in-memory Map; resets on server restart.
@@ -252,6 +275,19 @@ app.use('/improve-summary',     perClientIdLimiter);
 app.use('/generate-pdf',        perClientIdLimiter);
 app.use('/analyze-job-match',   perClientIdLimiter);
 app.use('/optimize-for-job',    perClientIdLimiter);
+
+// Payment endpoints — rate limited + session validated
+app.use('/create-order',        paymentLimiter);
+app.use('/create-order',        validateClientSession);
+app.use('/verify-payment',      paymentLimiter);
+app.use('/verify-payment',      validateClientSession);
+
+// Magic link — rate limited to prevent email spam
+app.use('/auth/magic-link/request', magicLinkLimiter);
+
+// Auth polling — light rate limit
+app.use('/auth/poll',           pollLimiter);
+app.use('/auth/init-poll',      pollLimiter);
 
 // ─── Health / version ─────────────────────────────────────────────────────────
 app.get('/version', (req, res) => {
