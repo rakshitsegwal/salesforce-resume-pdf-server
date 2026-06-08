@@ -9,7 +9,12 @@ const { Pool }   = require('pg');
 const nodemailer = require('nodemailer');
 const crypto     = require('crypto');
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const openai   = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const Razorpay = require('razorpay');
+const razorpay = new Razorpay({
+    key_id:     process.env.RAZORPAY_KEY_ID,
+    key_secret: process.env.RAZORPAY_KEY_SECRET
+});
 const app    = express();
 app.set('trust proxy', 1);
 
@@ -1859,6 +1864,123 @@ If no food visible: {"error":"No food detected."}` }
     } catch (e) {
         console.error('/analyze-food error:', e.message);
         res.status(500).json({ error: 'Food analysis failed. Please try again.' });
+    }
+});
+
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+// RAZORPAY — PAYMENT INTEGRATION
+// ═════════════════════════════════════════════════════════════════════════════
+
+const PLANS = {
+    pro_monthly:  { amount: 59900,  label: 'Pro Monthly',  currency: 'INR' },
+    pro_yearly:   { amount: 598800, label: 'Pro Yearly',   currency: 'INR' },
+    team_monthly: { amount: 179900, label: 'Team Monthly', currency: 'INR' },
+    team_yearly:  { amount: 1798800,label: 'Team Yearly',  currency: 'INR' }
+};
+
+// POST /create-order
+// Creates a Razorpay order server-side — key_secret never leaves the server
+app.post('/create-order', async (req, res) => {
+    try {
+        const { planId, userId } = req.body;
+
+        const plan = PLANS[planId];
+        if (!plan) {
+            return res.status(400).json({ error: 'Invalid plan ID' });
+        }
+        if (plan.amount < 100) {
+            return res.status(400).json({ error: 'Amount must be at least 100 paise' });
+        }
+
+        const receipt = `rcpt_${planId}_${Date.now()}`;
+
+        const order = await razorpay.orders.create({
+            amount:   plan.amount,
+            currency: plan.currency,
+            receipt:  receipt,
+            notes: {
+                plan:   planId,
+                userId: userId || 'guest'
+            }
+        });
+
+        console.log(`[${SERVER_VERSION}] Razorpay order created: ${order.id} plan=${planId}`);
+
+        res.json({
+            order_id: order.id,
+            amount:   order.amount,
+            currency: order.currency,
+            key_id:   process.env.RAZORPAY_KEY_ID   // safe: public key only
+        });
+
+    } catch (err) {
+        console.error(`[${SERVER_VERSION}] create-order error:`, err.message);
+        if (err.statusCode === 401) {
+            return res.status(401).json({ error: 'Razorpay auth failed — check credentials' });
+        }
+        res.status(500).json({ error: 'Failed to create order', details: err.message });
+    }
+});
+
+// POST /verify-payment
+// Verifies Razorpay signature using HMAC-SHA256 — never trust client-side success alone
+app.post('/verify-payment', async (req, res) => {
+    try {
+        const { razorpay_order_id, razorpay_payment_id, razorpay_signature, planId, userId } = req.body;
+
+        if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+            return res.status(400).json({ error: 'Missing payment fields' });
+        }
+
+        // HMAC-SHA256(order_id + "|" + payment_id, KEY_SECRET)
+        const body      = razorpay_order_id + '|' + razorpay_payment_id;
+        const expected  = crypto
+            .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
+            .update(body)
+            .digest('hex');
+
+        if (expected !== razorpay_signature) {
+            console.warn(`[${SERVER_VERSION}] Signature mismatch for order ${razorpay_order_id}`);
+            return res.status(400).json({ error: 'Invalid payment signature' });
+        }
+
+        // Signature valid — upgrade user plan if authenticated
+        const plan = PLANS[planId];
+        console.log(`[${SERVER_VERSION}] Payment verified: order=${razorpay_order_id} payment=${razorpay_payment_id} plan=${planId}`);
+
+        // Update DB if user is authenticated
+        if (userId && pool) {
+            try {
+                const expiresAt = planId.includes('yearly')
+                    ? new Date(Date.now() + 365 * 24 * 60 * 60 * 1000)
+                    : new Date(Date.now() + 30  * 24 * 60 * 60 * 1000);
+
+                await pool.query(
+                    `UPDATE users
+                     SET plan = 'pro', plan_expires_at = $1, updated_at = NOW()
+                     WHERE id = $2`,
+                    [expiresAt, userId]
+                );
+                console.log(`[${SERVER_VERSION}] User ${userId} upgraded to pro until ${expiresAt}`);
+            } catch (dbErr) {
+                // DB update failed — log but don't fail the response
+                // Payment was real; retry upgrade on next login
+                console.error(`[${SERVER_VERSION}] DB upgrade failed:`, dbErr.message);
+            }
+        }
+
+        res.json({
+            success:    true,
+            payment_id: razorpay_payment_id,
+            order_id:   razorpay_order_id,
+            plan:       planId
+        });
+
+    } catch (err) {
+        console.error(`[${SERVER_VERSION}] verify-payment error:`, err.message);
+        res.status(500).json({ error: 'Payment verification failed' });
     }
 });
 
