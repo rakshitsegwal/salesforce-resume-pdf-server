@@ -336,17 +336,18 @@ html, body {
     margin-bottom: 0 !important;
 }
 
-/* Ensure grid/flex body shrinks to actual content */
+/* PDF: let grid body auto-size, columns stretch to full row height */
 .rb-resume__body {
     height: auto !important;
     min-height: 0 !important;
-    align-items: start !important;
+    /* align-items NOT overridden here — let columns stretch naturally */
 }
 .rb-resume__sidebar,
 .rb-resume__main {
     height: auto !important;
     min-height: 0 !important;
-    align-self: start !important;
+    overflow: visible !important;
+    /* align-self NOT overridden — allows natural stretch fill */
 }
 
 .rb-resume__photo-placeholder,
@@ -419,18 +420,30 @@ app.post('/generate-pdf', async (req, res) => {
         await new Promise(r => setTimeout(r, 500));
 
         const bodyH = await page.evaluate(() => {
+            // Force full content visibility
+            document.body.style.overflow = 'visible';
+            document.documentElement.style.overflow = 'visible';
+
             const el = document.querySelector('.rb-resume');
-            if (!el) return document.body.scrollHeight;
-            // Force height recalc
+            if (!el) return document.documentElement.scrollHeight;
+
             el.style.minHeight = '0';
             el.style.height = 'auto';
-            // Also measure all children to catch content that may overflow
-            let maxH = el.getBoundingClientRect().height;
-            el.querySelectorAll('.rb-resume__sidebar, .rb-resume__main, .rb-resume__body').forEach(child => {
-                const h = child.getBoundingClientRect().bottom;
-                if (h > maxH) maxH = h;
+
+            // Measure the absolute bottom of every element inside the resume
+            // This catches content that overflows the container bounds
+            let maxBottom = 0;
+            el.querySelectorAll('*').forEach(child => {
+                const rect = child.getBoundingClientRect();
+                if (rect.bottom > maxBottom) maxBottom = rect.bottom;
             });
-            return Math.max(maxH, el.scrollHeight, 400);
+
+            return Math.max(
+                maxBottom,
+                el.scrollHeight,
+                document.documentElement.scrollHeight,
+                400
+            );
         });
         const pdfH = Math.min(Math.max(bodyH, 600), 3000); // allow up to ~2.5 A4 pages for dense resumes
         const pdf = await page.pdf({
@@ -638,44 +651,81 @@ function sanitizeAiCss(css) {
         }
     );
 
-    // ── Pass 3: Append hard layout safety overrides (highest specificity) ──
+    // ── Pass 1.5: Strip order/flex-order that swaps columns ─────────────────
+    css = css.replace(/\border\s*:\s*-?\d+\s*(!important)?\s*;/gi, '');
+    css = css.replace(/flex-order\s*:\s*-?\d+\s*(!important)?\s*;/gi, '');
+
+    // ── Pass 1.6: Strip visibility/opacity zero on structural elements ────────
+    css = css.replace(
+        /(\.rb-resume--ai-generated[^{]*\{[^}]*)visibility\s*:\s*hidden\s*(!important)?\s*;/gi,
+        '$1visibility: visible;'
+    );
+    css = css.replace(
+        /(\.rb-resume--ai-generated[^{]*\{[^}]*)opacity\s*:\s*0\s*(!important)?\s*;/gi,
+        '$1opacity: 1;'
+    );
+
+    // ── Pass 3: Append LOCKED structural overrides — AI cannot override these ──
+    // Using extreme specificity to beat anything the AI generates.
+    // These define the structural skeleton. AI only changes colors/fonts/borders.
     css += `
 
-/* ══ LAYOUT SAFETY OVERRIDES — injected by Renonym AI sanitizer ══
-   These run LAST and use !important to guarantee the resume
-   never breaks no matter what the AI generated above. */
+/* ══════════════════════════════════════════════════════════════════
+   RENONYM STRUCTURAL LOCK — AI cannot override these properties.
+   Covers every way the AI could break the two-column resume layout.
+   ══════════════════════════════════════════════════════════════════ */
 
-/* Root — visible overflow so nothing clips */
+/* Root container */
 .rb-resume--ai-generated {
     overflow: visible !important;
     box-sizing: border-box !important;
+    position: relative !important;
+    float: none !important;
+    display: block !important;
 }
 
-/* 2-col grid — locked. AI cannot change this. */
+/* Two-column body — locked forever */
 .rb-resume--ai-generated .rb-resume__body {
     display: grid !important;
     grid-template-columns: 210px 1fr !important;
+    grid-template-rows: auto !important;
+    grid-auto-rows: auto !important;
+    grid-template-areas: none !important;
     overflow: visible !important;
     position: relative !important;
     width: 100% !important;
+    height: auto !important;
+    min-height: 0 !important;
+    flex-direction: unset !important;
+    flex-wrap: unset !important;
 }
 
-/* Sidebar — flex column, never absolute, never floated */
+/* Sidebar — LEFT column, always */
 .rb-resume--ai-generated .rb-resume__sidebar {
+    grid-column: 1 / 2 !important;
+    grid-row: 1 !important;
+    order: 0 !important;
     display: flex !important;
     flex-direction: column !important;
-    gap: 0 !important;
     position: relative !important;
     float: none !important;
     overflow: visible !important;
     height: auto !important;
     min-height: 0 !important;
     width: auto !important;
+    max-width: none !important;
+    min-width: 0 !important;
+    align-self: stretch !important;
+    visibility: visible !important;
+    opacity: 1 !important;
     box-sizing: border-box !important;
 }
 
-/* Main column — same guarantees */
+/* Main — RIGHT column, always */
 .rb-resume--ai-generated .rb-resume__main {
+    grid-column: 2 / 3 !important;
+    grid-row: 1 !important;
+    order: 1 !important;
     display: flex !important;
     flex-direction: column !important;
     position: relative !important;
@@ -684,10 +734,15 @@ function sanitizeAiCss(css) {
     height: auto !important;
     min-height: 0 !important;
     width: auto !important;
+    max-width: none !important;
+    min-width: 0 !important;
+    align-self: stretch !important;
+    visibility: visible !important;
+    opacity: 1 !important;
     box-sizing: border-box !important;
 }
 
-/* Every section stacks naturally — never overlaps */
+/* Sections — stacked, visible, auto height */
 .rb-resume--ai-generated .rb-resume__section {
     position: relative !important;
     float: none !important;
@@ -698,30 +753,34 @@ function sanitizeAiCss(css) {
     flex-shrink: 0 !important;
     box-sizing: border-box !important;
     width: auto !important;
+    order: unset !important;
+    visibility: visible !important;
+    opacity: 1 !important;
 }
 
-/* Section titles — always visible, always a block */
+/* Section titles */
 .rb-resume--ai-generated .rb-section-title {
     display: block !important;
     position: relative !important;
     overflow: visible !important;
     height: auto !important;
     width: auto !important;
+    visibility: visible !important;
+    opacity: 1 !important;
 }
 
-/* Summary — wraps, never clips */
-.rb-resume--ai-generated .rb-summary,
-.rb-resume--ai-generated .rb-summary p {
+/* Summary */
+.rb-resume--ai-generated .rb-summary {
     position: relative !important;
     overflow: visible !important;
     height: auto !important;
     word-break: break-word !important;
-    overflow-wrap: break-word !important;
     white-space: normal !important;
     display: block !important;
+    visibility: visible !important;
 }
 
-/* Skills row — always wraps */
+/* Skills row */
 .rb-resume--ai-generated .rb-skills {
     display: flex !important;
     flex-wrap: wrap !important;
@@ -730,7 +789,7 @@ function sanitizeAiCss(css) {
     position: relative !important;
 }
 
-/* Skill pills — inline flex, never absolute */
+/* Skill pills */
 .rb-resume--ai-generated .rb-skill-pill {
     display: inline-flex !important;
     position: relative !important;
@@ -738,40 +797,57 @@ function sanitizeAiCss(css) {
     overflow: visible !important;
     white-space: nowrap !important;
     box-sizing: border-box !important;
+    order: unset !important;
+    visibility: visible !important;
+    opacity: 1 !important;
 }
 
-/* Experience + education items — block, visible, auto height */
+/* Experience and education items */
 .rb-resume--ai-generated .rb-exp-item,
-.rb-resume--ai-generated .rb-edu-item {
+.rb-resume--ai-generated .rb-edu-item,
+.rb-resume--ai-generated .rb-cert {
     position: relative !important;
     overflow: visible !important;
     height: auto !important;
     display: block !important;
     float: none !important;
     box-sizing: border-box !important;
+    order: unset !important;
+    visibility: visible !important;
+    opacity: 1 !important;
 }
 
-/* Bullet lists — visible, auto height */
-.rb-resume--ai-generated .rb-exp-bullets,
+/* Bullet lists */
+.rb-resume--ai-generated .rb-exp-bullets {
+    overflow: visible !important;
+    height: auto !important;
+    position: relative !important;
+    display: block !important;
+    list-style: disc !important;
+}
 .rb-resume--ai-generated .rb-exp-bullets li {
     overflow: visible !important;
     height: auto !important;
     position: relative !important;
     display: list-item !important;
+    visibility: visible !important;
+    opacity: 1 !important;
 }
 
-/* Contact row — wraps on overflow */
+/* Contact row */
 .rb-resume--ai-generated .rb-resume__contact {
     overflow: visible !important;
     flex-wrap: wrap !important;
     height: auto !important;
 }
 
-/* Header — always visible */
+/* Header */
 .rb-resume--ai-generated .rb-resume__header {
     overflow: visible !important;
     position: relative !important;
     height: auto !important;
+    display: flex !important;
+    order: unset !important;
 }
 `;
 
