@@ -699,6 +699,11 @@ function sanitizeAiCss(css) {
         /(\.rb-resume--ai-generated[^{]*(?:sidebar|main|body|section|summary|header)[^{]*\{[^}]*)\bheight\s*:\s*[\d.]+[a-z%]+\s*(!important)?\s*;/gi,
         '$1min-height: 0;'
     );
+    // Also strip min-height on the root resume element (prevents forced tall pages)
+    css = css.replace(
+        /(\.rb-resume--ai-generated\s*\{[^}]*)min-height\s*:\s*[\d.]+[a-z%]+\s*(!important)?\s*;/gi,
+        '$1/* min-height removed from root */'
+    );
 
     // Cap extreme padding (max 32px per side prevents blowout)
     css = css.replace(
@@ -710,11 +715,26 @@ function sanitizeAiCss(css) {
         }
     );
 
-    // Cap extreme font sizes to prevent blowout (max 24px body, 32px heading)
+    // Cap extreme font sizes to prevent blowout — both px and relative units
     css = css.replace(
         /\bfont-size\s*:\s*([\d]+)px\s*(!important)?\s*;/gi,
         function(m, val, imp) {
-            return parseInt(val, 10) > 32 ? 'font-size: 14px;' : m;
+            return parseInt(val, 10) > 18 ? 'font-size: 13px;' : m;
+        }
+    );
+    // Cap rem/em font sizes (AI loves using 1.2rem etc which makes sidebar too tall)
+    css = css.replace(
+        /\bfont-size\s*:\s*([\d.]+)(rem|em)\s*(!important)?\s*;/gi,
+        function(m, val, unit, imp) {
+            const px = parseFloat(val) * 16; // assume 16px base
+            return px > 18 ? 'font-size: 13px;' : m;
+        }
+    );
+    // Cap percentage font sizes
+    css = css.replace(
+        /\bfont-size\s*:\s*([\d.]+)%\s*(!important)?\s*;/gi,
+        function(m, val, imp) {
+            return parseFloat(val) > 110 ? 'font-size: 100%;' : m;
         }
     );
 
@@ -786,6 +806,9 @@ function sanitizeAiCss(css) {
     visibility: visible !important;
     opacity: 1 !important;
     box-sizing: border-box !important;
+    /* Lock sidebar font size — prevents oversized text pushing certs to page 2 */
+    font-size: 12px !important;
+    line-height: 1.4 !important;
 }
 
 /* Main — RIGHT column, always */
@@ -884,13 +907,16 @@ function sanitizeAiCss(css) {
     opacity: 1 !important;
 }
 
-/* Bullet lists */
+/* Bullet lists — list-style-position: outside prevents bullet/text overlap in PDF */
 .rb-resume--ai-generated .rb-exp-bullets {
     overflow: visible !important;
     height: auto !important;
     position: relative !important;
     display: block !important;
-    list-style: disc !important;
+    list-style: disc outside !important;
+    list-style-position: outside !important;
+    padding-left: 16px !important;
+    margin-left: 4px !important;
 }
 .rb-resume--ai-generated .rb-exp-bullets li {
     overflow: visible !important;
@@ -899,6 +925,10 @@ function sanitizeAiCss(css) {
     display: list-item !important;
     visibility: visible !important;
     opacity: 1 !important;
+    list-style: disc outside !important;
+    padding-left: 2px !important;
+    word-break: normal !important;
+    overflow-wrap: break-word !important;
 }
 
 /* Contact row */
@@ -990,283 +1020,160 @@ function validateAndFixContrast(css) {
 // Generates AI CSS — now supports optional inspiration image via base64
 // ═════════════════════════════════════════════════════════════════════════════
 app.post('/generate-template', async (req, res) => {
-
     try {
-        const {
-            prompt,
-            resumeData,
-            metadata,
-            inspirationBase64,
-            inspirationMimeType
-        } = req.body;
+        const { prompt, metadata, inspirationBase64, inspirationMimeType } = req.body;
 
         const hasInspiration = !!(
-            inspirationBase64 &&
-            inspirationMimeType &&
-            (inspirationMimeType.startsWith('image/') || inspirationMimeType === 'application/pdf') &&
-            inspirationBase64.length < 4 * 1024 * 1024  // 4MB base64 limit
+            inspirationBase64 && inspirationMimeType &&
+            inspirationMimeType.startsWith('image/') &&
+            inspirationBase64.length < 4 * 1024 * 1024
         );
 
-        // ── Step 0: AI color extraction — get exact hex palette from text prompt ──
-        // GPT reads the intent and returns precise hex codes before CSS generation.
-        // Handles brands, teams, aesthetics, moods — anything the user describes.
-        let colorPaletteBlock = '';
-        try {
-            const colorResp = await openai.chat.completions.create({
-                model: 'gpt-4.1-mini',
-                messages: [{
-                    role: 'system',
-                    content: 'You are a world-class color designer. Given a design brief, return ONLY a JSON object (no markdown) with exact hex color values. Keys: primary, secondary, accent, sidebarBg, sidebarText, headerBg, headerText, mainBg, reasoning.'
-                }, {
-                    role: 'user',
-                    content: 'Design brief: "' + sanitizeInput(prompt) + '"\n\nReturn the precise hex color palette as JSON only.'
-                }],
-                temperature: 0.2,
-                max_tokens: 250
-            });
-            let raw = colorResp.choices[0].message.content.trim();
-            raw = raw.replace(/^```json|^```|```$/gm, '').trim();
-            const palette = JSON.parse(raw);
-            console.log('[color-extraction] ' + (palette.reasoning || 'ok'));
-            colorPaletteBlock = [
-                'EXTRACTED COLOR PALETTE — use these EXACT hex values as your foundation:',
-                '  Header background:   ' + palette.headerBg,
-                '  Header text:         ' + palette.headerText,
-                '  Sidebar background:  ' + palette.sidebarBg,
-                '  Sidebar text:        ' + palette.sidebarText,
-                '  Primary accent:      ' + palette.primary,
-                '  Secondary accent:    ' + palette.secondary,
-                '  Highlight accent:    ' + palette.accent,
-                '  Main body bg:        ' + palette.mainBg,
-                '',
-                'START your CSS with these mandatory rules then build creatively on top:',
-                '.rb-resume--ai-generated .rb-resume__header { background: ' + palette.headerBg + '; }',
-                '.rb-resume--ai-generated .rb-resume__name { color: ' + palette.headerText + '; }',
-                '.rb-resume--ai-generated .rb-resume__sidebar { background: ' + palette.sidebarBg + '; }',
-            ].join('\n');
-        } catch (colorErr) {
-            console.warn('[color-extraction] failed (non-fatal):', colorErr.message);
-        }
-
-        // ── Step 1: If inspiration image provided, vision-analyse it first ──
-        let inspirationStyleSignals = '';
-
+        // ── Step 1: Vision analysis (if image uploaded) ──────────────────────
+        let styleSignals = '';
         if (hasInspiration) {
             try {
-                console.log(`[${SERVER_VERSION}] Analysing inspiration image (${inspirationMimeType})`);
-
-                const visionCompletion = await openai.chat.completions.create({
+                const v = await openai.chat.completions.create({
                     model: 'gpt-4o',
-                    messages: [
-                        {
-                            role: 'system',
-                            content: `You are a design analyst specialising in resume aesthetics and typography.
-Analyse the uploaded resume image and extract ONLY style/design signals.
-DO NOT extract or mention any personal data, names, companies, or content.
-Focus exclusively on: layout structure, colour palette, typography choices, spacing density, section divider styles, header treatment, sidebar vs single-column, font character (serif/sans), visual hierarchy signals.
-Return your analysis as a compact, structured paragraph of CSS-relevant design signals only.`
-                        },
-                        {
-                            role: 'user',
-                            content: [
-                                {
-                                    type: 'image_url',
-                                    image_url: {
-                                        url:    `data:${inspirationMimeType};base64,${inspirationBase64}`,
-                                        detail: 'low'   // Low detail sufficient for style extraction
-                                    }
-                                },
-                                {
-                                    type: 'text',
-                                    text: 'Analyse this resume image for design and style signals only. Extract: colour palette, typography style (serif/sans/mono), layout structure (columns, spacing), header style, section dividers, overall visual density. Return only design signals, no personal data.'
-                                }
-                            ]
-                        }
-                    ],
-                    max_tokens: 300,
-                    temperature: 0.3
+                    messages: [{ role: 'user', content: [
+                        { type: 'image_url', image_url: { url: `data:${inspirationMimeType};base64,${inspirationBase64}`, detail: 'low' } },
+                        { type: 'text', text: 'Analyse this resume for design signals only: color palette, layout structure, font style, spacing density. No personal data. Return a short paragraph.' }
+                    ]}],
+                    max_tokens: 200, temperature: 0.3
                 });
-
-                inspirationStyleSignals = visionCompletion.choices[0].message.content.trim();
-                console.log(`[${SERVER_VERSION}] Inspiration signals extracted:`, inspirationStyleSignals.slice(0, 100));
-
-            } catch (visionErr) {
-                // Non-fatal — proceed without inspiration signals
-                console.warn(`[${SERVER_VERSION}] Vision analysis failed (non-fatal):`, visionErr.message);
-            }
+                styleSignals = v.choices[0].message.content.trim();
+            } catch (e) { console.warn('[vision] failed (non-fatal):', e.message); }
         }
 
-        // ── Step 1.5: Classify layout from vision signals ──────────────────────
-        let detectedLayout = 'two-col'; // default
-        if (inspirationStyleSignals || prompt) {
-            try {
-                const layoutCompletion = await openai.chat.completions.create({
-                    model: 'gpt-4.1-mini',
-                    messages: [{
-                        role: 'user',
-                        content: `You are a resume layout classifier.
+        // ── Step 2: Classify layout ───────────────────────────────────────────
+        let layout = 'two-col';
+        try {
+            const lc = await openai.chat.completions.create({
+                model: 'gpt-4.1-mini',
+                messages: [{ role: 'user', content:
+                    `Design brief: "${sanitizeInput(prompt)}"
+Signals: ${styleSignals || 'none'}
 
-Given this design brief and style signals:
-PROMPT: ${sanitizeInput(prompt)}
-SIGNALS: ${inspirationStyleSignals || 'none'}
+` +
+                    `Classify layout as ONE word: two-col, single, top-banner, or asymmetric.
+` +
+                    `Reply with ONLY that one word.`
+                }],
+                max_tokens: 10, temperature: 0
+            });
+            const raw = lc.choices[0].message.content.trim().toLowerCase();
+            if (['two-col','single','top-banner','asymmetric'].includes(raw)) layout = raw;
+        } catch (e) { /* use default */ }
 
-Classify the layout as ONE of:
-- two-col: narrow left sidebar (skills/about) + wider right column (experience/education)
-- single: single full-width column, all sections stacked
-- top-banner: full-width coloured header across the top, content below
-- asymmetric: identity/contact/skills in left accent column (35%), experience/education in wider right (65%)
+        // ── Step 3: Extract design tokens (colors only — NO CSS generation) ──
+        // AI returns a simple JSON object with hex colors.
+        // The frontend applies these as CSS variables on a hardcoded layout.
+        // Structure is NEVER touched. Only colors and fonts change.
+        const tokenPrompt =
+            `You are a professional resume color designer.
+` +
+            `Design brief: "${sanitizeInput(prompt)}"
+` +
+            (styleSignals ? `Style inspiration signals: ${styleSignals}
+` : '') +
+            `
+Return ONLY a JSON object with EXACTLY these keys and valid hex color values:
+` +
+            `{
+` +
+            `  "headerBg":    "<hex - header/banner background>",
+` +
+            `  "headerText":  "<hex - name and title text on header bg>",
+` +
+            `  "headerSub":   "<rgba or hex - contact info on header bg, slightly dimmer>",
+` +
+            `  "sidebarBg":   "<hex - sidebar background>",
+` +
+            `  "sidebarText": "<hex - sidebar body text, readable on sidebarBg>",
+` +
+            `  "sidebarTitle":"<hex - sidebar section headings>",
+` +
+            `  "accent":      "<hex - highlight color for borders, lines, accents>",
+` +
+            `  "mainBg":      "<hex - main content area background, usually white>",
+` +
+            `  "mainText":    "<hex - main body text, usually near-black>",
+` +
+            `  "mainTitle":   "<hex - company names and section headings in main>",
+` +
+            `  "mainRole":    "<hex - job role and dates color>",
+` +
+            `  "skillBg":     "<hex - skill pill background>",
+` +
+            `  "skillText":   "<hex - skill pill text, readable on skillBg>",
+` +
+            `  "certBg":      "<hex - certification badge background>",
+` +
+            `  "certText":    "<hex - certification badge text>",
+` +
+            `  "fontBody":    "<CSS font-family string, web-safe only>",
+` +
+            `  "fontHeading": "<CSS font-family string, web-safe only>"
+` +
+            `}
 
-Reply with ONLY ONE word: two-col, single, top-banner, or asymmetric`
-                    }],
-                    max_tokens: 10,
-                    temperature: 0
-                });
-                const raw = layoutCompletion.choices[0].message.content.trim().toLowerCase();
-                if (['two-col','single','top-banner','asymmetric'].includes(raw)) {
-                    detectedLayout = raw;
-                }
-            } catch (e) {
-                // non-fatal — use default
-            }
-        }
+` +
+            `CRITICAL RULES:
+` +
+            `1. All colors must be real hex codes (e.g. #1a2b3c) or rgba() values
+` +
+            `2. Ensure WCAG AA contrast: text must be readable on its background
+` +
+            `3. headerText must contrast well against headerBg (ratio >= 4.5:1)
+` +
+            `4. sidebarText must contrast well against sidebarBg (ratio >= 4.5:1)
+` +
+            `5. mainText must be readable on mainBg (usually dark on white)
+` +
+            `6. Only web-safe fonts: system-ui, Georgia, "Times New Roman", "Courier New"
+` +
+            `7. Return ONLY the JSON object, nothing else`;
 
-        // ── Step 2: Generate CSS template ──
-        const systemPrompt = `You are an elite AI resume designer. You ONLY generate CSS.
-
-You design modern, premium, ATS-friendly resumes.
-
-RULES:
-- Output ONLY raw CSS. No markdown, no code fences, no explanations.
-- ONLY use class .rb-resume--ai-generated and its descendants.
-- All selectors MUST start with .rb-resume--ai-generated
-
-HARD CONSTRAINTS — violating ANY of these will break the resume:
-- FORBIDDEN: position: absolute or position: fixed (on ANY element)
-- FORBIDDEN: overflow: hidden or overflow: clip (on ANY element)
-- FORBIDDEN: display: none (on any element)
-- FORBIDDEN: float: left or float: right (on any element)
-- FORBIDDEN: negative margin values (any side)
-- FORBIDDEN: negative z-index values
-- FORBIDDEN: changing grid-template-columns on .rb-resume__body
-- FORBIDDEN: setting width on .rb-resume__sidebar or .rb-resume__main
-- FORBIDDEN: setting fixed pixel height on sidebar, main, body, or section
-- FORBIDDEN: padding values above 32px on any side
-- FORBIDDEN: font-size above 32px anywhere in the resume body
-
-ALLOWED — style ONLY these visual/cosmetic properties:
-- Colors: color, background-color, background (gradients OK)
-- Typography: font-family, font-size (8–24px), font-weight, letter-spacing, line-height, text-transform
-- Borders: border, border-radius, border-color, border-width, border-style
-- Spacing: padding (max 32px), margin (positive values only), gap
-- Decorative: box-shadow, opacity (never 0), text-decoration
-
-- Preserve readable font sizes (minimum 8px body, 10px headings).
-- Ensure high colour contrast for ATS scanning.
-- Keep the two-column sidebar + main layout intact.
-- Optimise for A4 single-page output.
-- Use web-safe fonts only: system-ui, Georgia, 'Times New Roman', 'Courier New'.
-
-CSS selectors available to style:
-.rb-resume--ai-generated
-.rb-resume--ai-generated .rb-resume__top-deco
-.rb-resume--ai-generated .rb-resume__header
-.rb-resume--ai-generated .rb-resume__photo-img
-.rb-resume--ai-generated .rb-resume__photo-placeholder
-.rb-resume--ai-generated .rb-resume__name
-.rb-resume--ai-generated .rb-resume__title-line
-.rb-resume--ai-generated .rb-resume__contact
-.rb-resume--ai-generated .rb-resume__contact-item
-.rb-resume--ai-generated .rb-resume__body
-.rb-resume--ai-generated .rb-resume__sidebar
-.rb-resume--ai-generated .rb-resume__main
-.rb-resume--ai-generated .rb-resume__section
-.rb-resume--ai-generated .rb-section-title
-.rb-resume--ai-generated .rb-summary
-.rb-resume--ai-generated .rb-skills
-.rb-resume--ai-generated .rb-skill-pill
-.rb-resume--ai-generated .rb-cert
-.rb-resume--ai-generated .rb-exp-item
-.rb-resume--ai-generated .rb-exp-head
-.rb-resume--ai-generated .rb-exp-company
-.rb-resume--ai-generated .rb-exp-date
-.rb-resume--ai-generated .rb-exp-role
-.rb-resume--ai-generated .rb-exp-bullets
-.rb-resume--ai-generated .rb-exp-bullets li
-.rb-resume--ai-generated .rb-edu-item
-.rb-resume--ai-generated .rb-edu-head
-.rb-resume--ai-generated .rb-edu-degree
-.rb-resume--ai-generated .rb-edu-years
-.rb-resume--ai-generated .rb-edu-school`;
-
-        const densityWarning = (metadata?.totalBullets > 12 || metadata?.experienceCount > 3)
-            ? `\nDENSITY WARNING: This resume has ${metadata?.totalBullets || 'many'} bullet points across ${metadata?.experienceCount || 'multiple'} roles.
-You MUST use compact CSS to fit it on one page:
-- .rb-resume--ai-generated font-size: 8.5px
-- .rb-resume--ai-generated .rb-resume__body padding: 0
-- .rb-resume--ai-generated .rb-resume__section margin-bottom: 10px
-- .rb-resume--ai-generated .rb-exp-item margin-bottom: 8px
-- .rb-resume--ai-generated .rb-exp-bullets li padding/margin: 1px
-- .rb-resume--ai-generated .rb-resume__header padding: 16px 24px 12px`
-            : '';
-
-        const inspirationBlock = inspirationStyleSignals
-            ? `\nSTYLE INSPIRATION SIGNALS (extracted from uploaded reference — translate these into equivalent CSS):
-${inspirationStyleSignals}`
-            : '';
-
-        const userPrompt = `USER DESIGN REQUEST:
-${sanitizeInput(prompt)}
-${colorPaletteBlock}
-${inspirationBlock}
-
-RESUME CONTENT METADATA:
-- Has photo: ${metadata?.hasPhoto || false}
-- Experience entries: ${metadata?.experienceCount || 0}
-- Skills: ${metadata?.skillCount || 0}
-- Certifications: ${metadata?.certificationCount || 0}
-- Education entries: ${metadata?.educationCount || 0}
-- Summary length: ${metadata?.summaryLength || 0} characters
-- Total bullet points across all roles: ${metadata?.totalBullets || 0}
-- Content density: ${metadata?.totalBullets > 12 || metadata?.experienceCount > 3 ? 'HIGH — use compact spacing' : 'NORMAL'}
-${densityWarning}
-
-Generate CSS that:
-1. Matches the design intent from the user request
-${inspirationStyleSignals ? '2. Incorporates the style signals from the inspiration image — translate their visual language into equivalent CSS for the rb-resume structure' : '2. Creates a distinctive, premium design'}
-3. Is specifically optimised for the content density above
-4. Keeps everything on ONE A4 page — this is critical
-5. Uses ONLY the .rb-resume--ai-generated namespace
-6. Returns ONLY raw CSS — nothing else`;
-
-        const completion = await openai.chat.completions.create({
-            model:       'gpt-4.1',         // better color accuracy
-            messages:    [
-                { role: 'system', content: systemPrompt },
-                { role: 'user',   content: userPrompt   }
-            ],
-            temperature: 0.65,
-            max_tokens:  3500
+        const tokenResp = await openai.chat.completions.create({
+            model: 'gpt-4.1-mini',
+            messages: [{ role: 'user', content: tokenPrompt }],
+            temperature: 0.2,
+            max_tokens: 500,
+            response_format: { type: 'json_object' }
         });
 
-        let css = completion.choices[0].message.content;
+        let tokens = {};
+        try {
+            tokens = JSON.parse(tokenResp.choices[0].message.content);
+        } catch (e) {
+            console.error('[tokens] parse error:', e.message);
+        }
 
-        // Strip any accidental markdown fences
-        css = css
-            .replace(/^```(?:css)?\s*/i, '')
-            .replace(/\s*```\s*$/,       '')
-            .trim();
+        // Validate contrast on the two most critical pairs and auto-fix if needed
+        const fixColor = (bgHex, textHex) => {
+            try {
+                if (contrastRatio(bgHex, textHex) < 4.5) {
+                    return ensureReadableText(bgHex);
+                }
+            } catch(e) {}
+            return textHex;
+        };
+        if (tokens.headerBg && tokens.headerText) {
+            tokens.headerText = fixColor(tokens.headerBg, tokens.headerText);
+        }
+        if (tokens.sidebarBg && tokens.sidebarText) {
+            tokens.sidebarText = fixColor(tokens.sidebarBg, tokens.sidebarText);
+        }
 
-        // Sanitize AI CSS — strips dangerous layout properties that cause overlap
-        css = sanitizeAiCss(css);
-
-        css = validateAndFixContrast(css);
-        res.json({ css, layout: detectedLayout || 'two-col' });
+        console.log(`[${SERVER_VERSION}] /generate-template layout=${layout} headerBg=${tokens.headerBg}`);
+        res.json({ layout, tokens });
 
     } catch (e) {
-        console.error('Template generation error:', e);
+        console.error('generate-template error:', e);
         res.status(500).json({ error: 'Template generation failed' });
     }
 });
+
 
 // ═════════════════════════════════════════════════════════════════════════════
 // POST /improve-summary
