@@ -16,6 +16,7 @@ app.set('trust proxy', 1);
 const ALLOWED_ORIGINS = [
     'https://developwithrax-dev-ed.my.site.com',
     process.env.FRONTEND_URL || ''
+    ...(process.env.ALLOWED_ORIGINS_EXTRA || '').split(',').filter(Boolean)
 ].filter(Boolean);
 
 app.use(cors({
@@ -257,6 +258,65 @@ app.get('/version', (req, res) => {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
+// ── WCAG contrast helpers ─────────────────────────────────────────────────────
+function hexToRgb(hex) {
+    hex = hex.replace(/^#/, '');
+    if (hex.length === 3) hex = hex.split('').map(c => c+c).join('');
+    const n = parseInt(hex, 16);
+    return { r: (n >> 16) & 255, g: (n >> 8) & 255, b: n & 255 };
+}
+function relativeLuminance({ r, g, b }) {
+    return [r, g, b].reduce((sum, v, i) => {
+        v /= 255;
+        v = v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+        return sum + v * [0.2126, 0.7152, 0.0722][i];
+    }, 0);
+}
+function contrastRatio(hex1, hex2) {
+    try {
+        const l1 = relativeLuminance(hexToRgb(hex1));
+        const l2 = relativeLuminance(hexToRgb(hex2));
+        const [hi, lo] = [Math.max(l1,l2), Math.min(l1,l2)];
+        return (hi + 0.05) / (lo + 0.05);
+    } catch { return 4.5; }
+}
+function ensureReadableText(bgHex) {
+    const rw = contrastRatio(bgHex, '#FFFFFF');
+    const rb = contrastRatio(bgHex, '#000000');
+    if (rw >= 4.5) return '#FFFFFF';
+    if (rb >= 4.5) return '#000000';
+    return rw > rb ? '#FFFFFF' : '#111111';
+}
+
+function validateAndFixContrast(css) {
+    const fixes = [];
+    // Check sidebar text on sidebar background
+    const sidebarBgM = css.match(/\.rb-resume--ai-generated\s+\.rb-resume__sidebar\s*\{[^}]*background(?:-color)?\s*:\s*(#[0-9A-Fa-f]{3,8})/);
+    if (sidebarBgM) {
+        const bg = sidebarBgM[1];
+        const sidebarTextM = css.match(/\.rb-resume--ai-generated\s+\.rb-resume__sidebar\s*\{[^}]*\bcolor\s*:\s*(#[0-9A-Fa-f]{3,8})/);
+        if (!sidebarTextM || contrastRatio(bg, sidebarTextM[1]) < 4.5) {
+            const fixed = ensureReadableText(bg);
+            css += `\n/* contrast-fix */\n.rb-resume--ai-generated .rb-resume__sidebar { color: ${fixed}; }\n.rb-resume--ai-generated .rb-resume__sidebar .rb-section-title { color: ${fixed}; opacity: 0.7; }\n.rb-resume--ai-generated .rb-resume__sidebar .rb-summary { color: ${fixed}; opacity: 0.85; }\n.rb-resume--ai-generated .rb-resume__sidebar .rb-cert { color: ${fixed}; opacity: 0.85; }`;
+            fixes.push('sidebar text → ' + fixed);
+        }
+    }
+    // Check header text on header background
+    const headerBgM = css.match(/\.rb-resume--ai-generated\s+\.rb-resume__header\s*\{[^}]*background(?:-color)?\s*:\s*(#[0-9A-Fa-f]{3,8})/);
+    if (headerBgM) {
+        const bg = headerBgM[1];
+        const nameM = css.match(/\.rb-resume--ai-generated\s+\.rb-resume__name\s*\{[^}]*\bcolor\s*:\s*(#[0-9A-Fa-f]{3,8})/);
+        if (!nameM || contrastRatio(bg, nameM[1]) < 4.5) {
+            const fixed = ensureReadableText(bg);
+            css += `\n/* contrast-fix */\n.rb-resume--ai-generated .rb-resume__name { color: ${fixed} !important; }\n.rb-resume--ai-generated .rb-resume__title-line { color: ${fixed}; opacity: 0.82; }\n.rb-resume--ai-generated .rb-resume__contact-item { color: ${fixed}; opacity: 0.72; }`;
+            fixes.push('header text → ' + fixed);
+        }
+    }
+    if (fixes.length) console.log('[contrast-fix]', fixes.join(', '));
+    return css;
+}
+
+
 // Accepts: standard UUID (36 chars), or UUID-with-extras (up to 72 chars)
 // Rejects: SQL injection strings, script tags, arbitrary text
 const CLIENT_ID_PATTERN = /^[a-zA-Z0-9\-_]{8,72}$/;
@@ -395,11 +455,18 @@ app.post('/generate-pdf', async (req, res) => {
         await page.emulateMediaType('screen');
         await page.evaluateHandle('document.fonts.ready');
 
+        // Measure actual content height — no trailing whitespace
+        const contentHeight = await page.evaluate(() => {
+            const el = document.querySelector('.rb-resume') || document.body;
+            return Math.max(el.scrollHeight, el.offsetHeight, 600);
+        });
+        const pdfHeight = Math.min(Math.max(contentHeight, 600), 1500);
+
         const pdf = await page.pdf({
-            format: 'A4',
+            width:           '794px',
+            height:          `${pdfHeight}px`,
             printBackground: true,
-            preferCSSPageSize: true,
-            margin: { top: '0', right: '0', bottom: '0', left: '0' }
+            margin:          { top: '0', right: '0', bottom: '0', left: '0' }
         });
 
         await browser.close();
@@ -716,7 +783,7 @@ function sanitizeAiCss(css) {
 
 
 // POST /generate-template
-// Generates AI CSS — now supports optional inspiration image via base64
+// Generates AI CSS — brand-aware, contrast-validated, layout-classified
 // ═════════════════════════════════════════════════════════════════════════════
 app.post('/generate-template', async (req, res) => {
 
@@ -736,6 +803,100 @@ app.post('/generate-template', async (req, res) => {
             inspirationBase64.length < 4 * 1024 * 1024  // 4MB base64 limit
         );
 
+        // ── Step 0: Brand palette detection from text prompt ──────────────────
+        let brandBlock = '';
+        if (brandMatch) {
+            const { keyword, palette } = brandMatch;
+            brandBlock = `
+BRAND PALETTE DETECTED — "${keyword.toUpperCase()}"
+Use EXACTLY these hex colors — do NOT approximate or guess:
+  Header background:  ${palette.headerBg}
+  Header text:        ${palette.headerText}
+  Sidebar background: ${palette.sidebar}
+  Sidebar text:       ${palette.sidebarText}
+  Primary accent:     ${palette.primary}
+  Secondary accent:   ${palette.secondary}
+  Highlight/accent:   ${palette.accent}
+
+MANDATORY CSS RULES from this palette:
+.rb-resume--ai-generated .rb-resume__header { background: ${palette.headerBg} !important; }
+.rb-resume--ai-generated .rb-resume__name { color: ${palette.headerText} !important; }
+.rb-resume--ai-generated .rb-resume__title-line { color: ${palette.headerText}; opacity: 0.85; }
+.rb-resume--ai-generated .rb-resume__contact-item { color: ${palette.headerText}; opacity: 0.75; }
+.rb-resume--ai-generated .rb-resume__sidebar { background: ${palette.sidebar} !important; }
+.rb-resume--ai-generated .rb-resume__sidebar * { color: ${palette.sidebarText}; }
+Then use ${palette.primary} and ${palette.secondary} creatively for section titles, borders, skill pills etc.`;
+            console.log(\`[${SERVER_VERSION}] Brand matched: "${keyword}" → primary ${palette.primary}\`);
+        }
+
+        // ── Step 0: Color intelligence — extract precise palette from text prompt ──
+        // GPT reads the user's intent and returns exact hex codes BEFORE CSS generation.
+        // This prevents vague color guessing (e.g. "Barcelona" → actual club colors,
+        // "sunset" → real sunset gradient hex values, "IBM" → actual brand blues).
+        let colorPaletteBlock = '';
+        try {
+            const colorExtraction = await openai.chat.completions.create({
+                model: 'gpt-4.1',
+                messages: [{
+                    role: 'system',
+                    content: `You are a world-class color designer with encyclopedic knowledge of brand colors, sports teams, design aesthetics, cultural references, artists, movies, eras, and color theory.
+
+Your job: read a design brief and return the EXACT hex color palette to use — no vagueness, no approximations.
+
+Rules:
+- If a brand/team/product is mentioned: use their ACTUAL official brand colors
+- If a design style is mentioned: extract the precise colors that define that style
+- If a mood/feeling: pick specific hex values that create that emotion
+- Always output exactly: primary, secondary, accent, sidebar background, sidebar text, header background, header text
+
+OUTPUT FORMAT (JSON only, no explanation):
+{
+  "primary": "#XXXXXX",
+  "secondary": "#XXXXXX", 
+  "accent": "#XXXXXX",
+  "sidebarBg": "#XXXXXX",
+  "sidebarText": "#XXXXXX",
+  "headerBg": "#XXXXXX",
+  "headerText": "#XXXXXX",
+  "mainBg": "#XXXXXX",
+  "reasoning": "one sentence explaining the color choices"
+}`
+                }, {
+                    role: 'user',
+                    content: `Design brief: "${sanitizeInput(prompt)}"
+                    
+Extract the precise hex color palette for a resume styled after this brief.
+Return ONLY the JSON object, nothing else.`
+                }],
+                temperature: 0.2,
+                max_tokens: 300,
+                response_format: { type: 'json_object' }
+            });
+
+            const palette = JSON.parse(colorExtraction.choices[0].message.content);
+            console.log(`[${SERVER_VERSION}] Color palette extracted:`, palette.reasoning || 'ok');
+
+            colorPaletteBlock = `
+EXTRACTED COLOR PALETTE (use these EXACT hex values — this is the authoritative palette for this design):
+  Primary color:       ${palette.primary}
+  Secondary color:     ${palette.secondary}
+  Accent color:        ${palette.accent}
+  Sidebar background:  ${palette.sidebarBg}
+  Sidebar text:        ${palette.sidebarText}
+  Header background:   ${palette.headerBg}
+  Header text:         ${palette.headerText}
+  Main body background:${palette.mainBg}
+
+MANDATORY — inject these colors as the foundation of your CSS:
+.rb-resume--ai-generated .rb-resume__header { background: ${palette.headerBg}; }
+.rb-resume--ai-generated .rb-resume__name { color: ${palette.headerText}; }
+.rb-resume--ai-generated .rb-resume__sidebar { background: ${palette.sidebarBg}; }
+(Then build creatively on top of these anchors for all other elements)`;
+
+        } catch (colorErr) {
+            console.warn(`[${SERVER_VERSION}] Color extraction failed (non-fatal):`, colorErr.message);
+        }
+
         // ── Step 1: If inspiration image provided, vision-analyse it first ──
         let inspirationStyleSignals = '';
 
@@ -748,11 +909,25 @@ app.post('/generate-template', async (req, res) => {
                     messages: [
                         {
                             role: 'system',
-                            content: `You are a design analyst specialising in resume aesthetics and typography.
-Analyse the uploaded resume image and extract ONLY style/design signals.
-DO NOT extract or mention any personal data, names, companies, or content.
-Focus exclusively on: layout structure, colour palette, typography choices, spacing density, section divider styles, header treatment, sidebar vs single-column, font character (serif/sans), visual hierarchy signals.
-Return your analysis as a compact, structured paragraph of CSS-relevant design signals only.`
+                            content: `You are a design analyst specialising in resume CSS extraction.
+Analyse the uploaded resume image for design signals ONLY — no personal data.
+
+Return a structured analysis with EXACT hex color codes wherever possible:
+
+FORMAT YOUR RESPONSE EXACTLY LIKE THIS:
+HEADER: background=#XXXXXX, text=#XXXXXX
+SIDEBAR: background=#XXXXXX, text=#XXXXXX  
+SECTION TITLES: color=#XXXXXX
+ACCENT COLOR: #XXXXXX
+SKILL PILLS: background=#XXXXXX, text=#XXXXXX
+BODY TEXT: color=#XXXXXX
+FONT STYLE: [serif/sans-serif/mono]
+LAYOUT: [single-column/two-column-sidebar/top-banner]
+SPACING: [tight/medium/airy]
+DIVIDERS: [style description]
+VISUAL MOOD: [1 sentence description]
+
+Extract the ACTUAL hex values you see in the image. If unsure of exact hex, give your closest estimate.`
                         },
                         {
                             role: 'user',
@@ -815,10 +990,37 @@ ALLOWED — style ONLY these visual/cosmetic properties:
 - Decorative: box-shadow, opacity (never 0), text-decoration
 
 - Preserve readable font sizes (minimum 8px body, 10px headings).
-- Ensure high colour contrast for ATS scanning.
 - Keep the two-column sidebar + main layout intact.
 - Optimise for A4 single-page output.
-- Use web-safe fonts only: system-ui, Georgia, 'Times New Roman', 'Courier New'.
+- Use web-safe fonts only: system-ui, Georgia, 'Times New Roman', 'Courier New', Helvetica.
+
+CONTRAST RULES — CRITICAL FOR READABILITY (WCAG AA):
+- Dark background sidebar (#000 to #555) → text MUST be #FFFFFF or near-white
+- Medium background sidebar (#555 to #999) → text MUST be #000000 or #FFFFFF (test contrast)
+- Light background sidebar (#AAA to #FFF) → text MUST be #111111 or dark color
+- Header with dark background → name, title, contact MUST be white or light
+- NEVER put dark text on dark background. NEVER put light text on light background.
+- Minimum contrast ratio 4.5:1 for all body text
+
+VISUAL HIERARCHY RULES:
+- The name (.rb-resume__name) must be the LARGEST text element on the page
+- Section titles (.rb-section-title) must clearly stand out from body text
+- Skill pills (.rb-skill-pill) must be readable — check text vs pill background contrast
+- Company names must be bold or prominent
+- Dates must be visually subdued (lighter color or smaller)
+
+COMPLETENESS REQUIREMENT:
+You MUST style ALL of these — incomplete designs look broken:
+1. .rb-resume--ai-generated (overall background + font)
+2. .rb-resume__header (background + any decorative treatment)
+3. .rb-resume__name (size, weight, color)
+4. .rb-resume__sidebar (background color)
+5. .rb-resume__sidebar * or explicit sidebar text color
+6. .rb-section-title (color, border or decoration)
+7. .rb-skill-pill (background, color, border-radius)
+8. .rb-exp-company (color, weight)
+9. .rb-exp-role (style)
+10. .rb-resume__top-deco (height + background)
 
 CSS selectors available to style:
 .rb-resume--ai-generated
@@ -870,6 +1072,7 @@ ${inspirationStyleSignals}`
 
         const userPrompt = `USER DESIGN REQUEST:
 ${sanitizeInput(prompt)}
+${colorPaletteBlock}
 ${inspirationBlock}
 
 RESUME CONTENT METADATA:
@@ -892,13 +1095,13 @@ ${inspirationStyleSignals ? '2. Incorporates the style signals from the inspirat
 6. Returns ONLY raw CSS — nothing else`;
 
         const completion = await openai.chat.completions.create({
-            model:       'gpt-4.1-mini',
+            model:       'gpt-4.1',          // upgraded: better color accuracy than mini
             messages:    [
                 { role: 'system', content: systemPrompt },
                 { role: 'user',   content: userPrompt   }
             ],
-            temperature: 0.85,
-            max_tokens:  2000
+            temperature: 0.65,               // lower: more precise, less hallucinated colors
+            max_tokens:  3500                // higher: ensures all selectors are styled
         });
 
         let css = completion.choices[0].message.content;
@@ -912,7 +1115,24 @@ ${inspirationStyleSignals ? '2. Incorporates the style signals from the inspirat
         // Sanitize AI CSS — strips dangerous layout properties that cause overlap
         css = sanitizeAiCss(css);
 
-        res.json({ css });
+        // Validate and auto-fix contrast issues (WCAG AA compliance)
+        css = validateAndFixContrast(css);
+
+        // Ensure completeness — inject fallback if critical selectors missing
+        const REQUIRED = ['.rb-resume__name', '.rb-resume__sidebar', '.rb-section-title', '.rb-skill-pill'];
+        const missingSelectors = REQUIRED.filter(sel => !css.includes(sel));
+        if (missingSelectors.length > 2) {
+            console.warn('[generate-template] CSS incomplete, adding fallback baseline');
+            css += `
+/* fallback baseline — generated CSS was incomplete */
+.rb-resume--ai-generated .rb-resume__name { font-size: 20px; font-weight: 700; }
+.rb-resume--ai-generated .rb-resume__sidebar { background: #f5f5f5; }
+.rb-resume--ai-generated .rb-section-title { font-weight: 700; letter-spacing: 0.08em; border-bottom: 1px solid currentColor; }
+.rb-resume--ai-generated .rb-skill-pill { background: #e8e8e8; color: #333; border-radius: 4px; }`;
+        }
+
+        console.log(\`[generate-template] CSS generated: \${css.length} chars, brand: \${brandMatch?.keyword || 'none'}\`);
+        res.json({ css, layout: detectedLayout });
 
     } catch (e) {
         console.error('Template generation error:', e);
