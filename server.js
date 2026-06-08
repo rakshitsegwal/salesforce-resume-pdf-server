@@ -421,12 +421,18 @@ app.post('/generate-pdf', async (req, res) => {
         const bodyH = await page.evaluate(() => {
             const el = document.querySelector('.rb-resume');
             if (!el) return document.body.scrollHeight;
-            // Force height recalc by reading layout
+            // Force height recalc
             el.style.minHeight = '0';
             el.style.height = 'auto';
-            return Math.max(el.getBoundingClientRect().height, el.scrollHeight, 400);
+            // Also measure all children to catch content that may overflow
+            let maxH = el.getBoundingClientRect().height;
+            el.querySelectorAll('.rb-resume__sidebar, .rb-resume__main, .rb-resume__body').forEach(child => {
+                const h = child.getBoundingClientRect().bottom;
+                if (h > maxH) maxH = h;
+            });
+            return Math.max(maxH, el.scrollHeight, 400);
         });
-        const pdfH = Math.min(Math.max(bodyH, 600), 1500);
+        const pdfH = Math.min(Math.max(bodyH, 600), 3000); // allow up to ~2.5 A4 pages for dense resumes
         const pdf = await page.pdf({
             width: '794px',
             height: pdfH + 'px',
@@ -570,10 +576,36 @@ function sanitizeAiCss(css) {
 
     // ── Pass 2: Protect structural sizing constraints ──────────────────────
 
-    // Strip grid-template-columns overrides on the body (preserve 2-col layout)
+    // Strip ALL grid/flex structural overrides — lock the 2-col layout
+    // grid-template-columns
     css = css.replace(
         /(\.rb-resume--ai-generated[^{]*\.rb-resume__body[^{]*\{[^}]*)grid-template-columns\s*:[^;]+;/gi,
-        '$1/* grid-template-columns locked to 210px 1fr */'
+        '$1/* grid-template-columns locked */'
+    );
+    // grid-template-rows (can push content off page)
+    css = css.replace(
+        /(\.rb-resume--ai-generated[^{]*\{[^}]*)grid-template-rows\s*:[^;]+;/gi,
+        '$1/* grid-template-rows removed */'
+    );
+    // grid-area (can reposition elements)
+    css = css.replace(
+        /(\.rb-resume--ai-generated[^{]*\{[^}]*)grid-area\s*:[^;]+;/gi,
+        '$1/* grid-area removed */'
+    );
+    // grid-column / grid-row spans
+    css = css.replace(
+        /(\.rb-resume--ai-generated[^{]*\{[^}]*)grid-(?:column|row)\s*:[^;]+;/gi,
+        '$1/* grid span removed */'
+    );
+    // display: grid or flex on sidebar/main (breaks the column structure)
+    css = css.replace(
+        /(\.rb-resume--ai-generated[^{]*(?:sidebar|main)[^{]*\{[^}]*)display\s*:\s*(?:grid|flex)\s*(!important)?\s*;/gi,
+        '$1display: block;'
+    );
+    // min-width on sidebar (breaks the column width)
+    css = css.replace(
+        /(\.rb-resume--ai-generated[^{]*(?:sidebar)[^{]*\{[^}]*)min-width\s*:[^;]+;/gi,
+        '$1/* min-width removed */'
     );
 
     // Strip width overrides on sidebar/main (let grid control sizing)
