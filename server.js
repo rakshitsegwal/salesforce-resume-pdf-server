@@ -246,6 +246,20 @@ setInterval(() => {
     }
 }, 30 * 60 * 1000);
 
+// ── API secret check — applied to all protected endpoints ────────────────────
+// Rejects any request that doesn't include the correct x-api-secret header.
+// This blocks direct API scraping even if someone finds the Railway URL.
+app.use('/generate-template',   validateApiSecret);
+app.use('/extract-resume',      validateApiSecret);
+app.use('/review-resume',       validateApiSecret);
+app.use('/improve-summary',     validateApiSecret);
+app.use('/generate-pdf',        validateApiSecret);
+app.use('/analyze-job-match',   validateApiSecret);
+app.use('/optimize-for-job',    validateApiSecret);
+app.use('/analyze-food',        validateApiSecret);
+app.use('/create-order',        validateApiSecret);
+app.use('/verify-payment',      validateApiSecret);
+
 // IP-based rate limits
 app.use('/generate-template',   aiLimiter);
 app.use('/extract-resume',      aiLimiter);
@@ -303,6 +317,23 @@ app.get('/version', (req, res) => {
 // Accepts: standard UUID (36 chars), or UUID-with-extras (up to 72 chars)
 // Rejects: SQL injection strings, script tags, arbitrary text
 const CLIENT_ID_PATTERN = /^[a-zA-Z0-9\-_]{8,72}$/;
+
+// ─── Shared API secret — first line of defence against external scraping ──────
+// Set RENONYM_API_SECRET in Railway env vars (any long random string, 32+ chars)
+// Frontend sends it as x-api-secret header (via VITE_API_SECRET env var)
+const API_SECRET = process.env.RENONYM_API_SECRET || null;
+
+function validateApiSecret(req, res, next) {
+    // If no secret configured on server, skip check (dev mode / not yet set up)
+    if (!API_SECRET) return next();
+
+    const provided = req.headers['x-api-secret'];
+    if (!provided || provided !== API_SECRET) {
+        console.warn(`[API-SECRET] Rejected request — invalid secret. IP=${req.ip} path=${req.path}`);
+        return res.status(401).json({ error: 'Unauthorised.' });
+    }
+    next();
+}
 
 function validateClientSession(req, res, next) {
     const clientId = req.headers['x-client-id'];
