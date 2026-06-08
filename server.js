@@ -288,7 +288,7 @@ function sanitizeInput(value) {
 
 // ─── PDF override CSS ─────────────────────────────────────────────────────────
 const PDF_OVERRIDE_CSS = `
-@page { size: A4; margin: 0; }
+/* @page intentionally omitted — size is set dynamically in page.pdf() */
 
 html, body {
     margin: 0 !important;
@@ -329,6 +329,19 @@ html, body {
 .rp-preview__scale-wrap {
     transform: none !important;
     margin-bottom: 0 !important;
+}
+
+/* Ensure grid/flex body shrinks to actual content */
+.rb-resume__body {
+    height: auto !important;
+    min-height: 0 !important;
+    align-items: start !important;
+}
+.rb-resume__sidebar,
+.rb-resume__main {
+    height: auto !important;
+    min-height: 0 !important;
+    align-self: start !important;
 }
 
 .rb-resume__photo-placeholder,
@@ -374,7 +387,7 @@ app.post('/generate-pdf', async (req, res) => {
         });
 
         const page = await browser.newPage();
-        await page.setViewport({ width: 794, height: 1123, deviceScaleFactor: 2 });
+        await page.setViewport({ width: 794, height: 200, deviceScaleFactor: 2 }); // Start small — grows to fit content
 
         const fullHtml = `<!DOCTYPE html>
 <html>
@@ -397,9 +410,16 @@ app.post('/generate-pdf', async (req, res) => {
         await page.emulateMediaType('screen');
         await page.evaluateHandle('document.fonts.ready');
 
+        // Wait a tick for layout to stabilise after fonts/images load
+        await new Promise(r => setTimeout(r, 500));
+
         const bodyH = await page.evaluate(() => {
-            const el = document.querySelector('.rb-resume') || document.body;
-            return Math.max(el.scrollHeight, el.offsetHeight, 600);
+            const el = document.querySelector('.rb-resume');
+            if (!el) return document.body.scrollHeight;
+            // Force height recalc by reading layout
+            el.style.minHeight = '0';
+            el.style.height = 'auto';
+            return Math.max(el.getBoundingClientRect().height, el.scrollHeight, 400);
         });
         const pdfH = Math.min(Math.max(bodyH, 600), 1500);
         const pdf = await page.pdf({
