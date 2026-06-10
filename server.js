@@ -74,7 +74,7 @@ app.use(
 );
 
 // --- Version marker ---------------------------------------------------------
-const SERVER_VERSION = 'v11-coach-2026';
+const SERVER_VERSION = 'v11.1-coach-2026';
 const BOOT_TIME      = Date.now();
 
 // --- Auth config ------------------------------------------------------------
@@ -2112,38 +2112,45 @@ app.post('/verify-payment', async (req, res) => {
         const plan = PLANS[planId];
         console.log(`[${SERVER_VERSION}] Payment verified: order=${razorpay_order_id} payment=${razorpay_payment_id} plan=${planId}`);
 
-        // Update DB if user is authenticated
-        if (userId && db) {
+        // Resolve the user to grant to. Prefer the signed-in JWT (always sent by
+        // the client) over the body userId, which can be missing/stale — that was
+        // causing Coach entitlement to silently not save after payment.
+        let grantUserId = null;
+        try {
+            const ah = req.headers['authorization'] || '';
+            const tk = ah.startsWith('Bearer ') ? ah.slice(7) : null;
+            if (tk) grantUserId = jwt.verify(tk, JWT_SECRET).id;
+        } catch (e) { /* ignore bad/expired token */ }
+        if (!grantUserId) grantUserId = userId;
+        const coach = plan && plan.coach; // 'unlimited' | 'pass' | undefined
+        console.log(`[${SERVER_VERSION}] grant → user=${grantUserId} plan=${planId} coach=${coach || 'none'}`);
+
+        if (grantUserId && db) {
             try {
                 const expiresAt = planId.includes('yearly')
                     ? new Date(Date.now() + 365 * 24 * 60 * 60 * 1000)
                     : new Date(Date.now() + 30  * 24 * 60 * 60 * 1000);
 
-                const coach = plan && plan.coach; // 'unlimited' | 'pass' | undefined
+                let rc = 0;
                 if (coach === 'unlimited') {
-                    await db.query(
-                        `UPDATE rn_users SET coach_plan='unlimited', coach_expires=$2, updated_at=NOW() WHERE id=$1`,
-                        [userId, expiresAt]
-                    );
-                    console.log(`[${SERVER_VERSION}] User ${userId} → Coach Unlimited until ${expiresAt}`);
+                    const r = await db.query(`UPDATE rn_users SET coach_plan='unlimited', coach_expires=$2, updated_at=NOW() WHERE id=$1`, [grantUserId, expiresAt]);
+                    rc = r.rowCount;
+                    console.log(`[${SERVER_VERSION}] Coach Unlimited granted (rows=${rc}) until ${expiresAt}`);
                 } else if (coach === 'pass') {
-                    await db.query(
-                        `UPDATE rn_users SET session_passes = COALESCE(session_passes,0) + 1, updated_at=NOW() WHERE id=$1`,
-                        [userId]
-                    );
-                    console.log(`[${SERVER_VERSION}] User ${userId} → +1 Coach Session Pass`);
+                    const r = await db.query(`UPDATE rn_users SET session_passes = COALESCE(session_passes,0) + 1, updated_at=NOW() WHERE id=$1`, [grantUserId]);
+                    rc = r.rowCount;
+                    console.log(`[${SERVER_VERSION}] Session Pass granted (rows=${rc})`);
                 } else {
-                    await db.query(
-                        `UPDATE rn_users SET plan = 'pro', updated_at = NOW() WHERE id = $1`,
-                        [userId]
-                    );
-                    console.log(`[${SERVER_VERSION}] User ${userId} upgraded to pro until ${expiresAt}`);
+                    const r = await db.query(`UPDATE rn_users SET plan = 'pro', updated_at = NOW() WHERE id = $1`, [grantUserId]);
+                    rc = r.rowCount;
+                    console.log(`[${SERVER_VERSION}] Pro granted (rows=${rc})`);
                 }
+                if (rc === 0) console.error(`[${SERVER_VERSION}] GRANT MATCHED 0 ROWS — user id not found: ${grantUserId}`);
             } catch (dbErr) {
-                // DB update failed - log but don't fail the response
-                // Payment was real; retry upgrade on next login
-                console.error(`[${SERVER_VERSION}] DB upgrade failed:`, dbErr.message);
+                console.error(`[${SERVER_VERSION}] DB grant failed:`, dbErr.message);
             }
+        } else {
+            console.error(`[${SERVER_VERSION}] NO grantUserId — entitlement NOT saved (body userId=${userId})`);
         }
 
         res.json({
