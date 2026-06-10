@@ -115,6 +115,9 @@ if (process.env.DATABASE_URL) {
         );
         CREATE INDEX IF NOT EXISTS idx_rn_users_email    ON rn_users(email);
         CREATE INDEX IF NOT EXISTS idx_rn_users_prov     ON rn_users(provider, provider_user_id);
+        -- Shared per-user daily premium-action quota (free tier). Pro = unlimited.
+        ALTER TABLE rn_users ADD COLUMN IF NOT EXISTS daily_premium_count INTEGER DEFAULT 0;
+        ALTER TABLE rn_users ADD COLUMN IF NOT EXISTS daily_premium_date  DATE;
         CREATE TABLE IF NOT EXISTS rn_saved_resumes (
             id             UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
             user_id        UUID         NOT NULL REFERENCES rn_users(id) ON DELETE CASCADE,
@@ -289,6 +292,94 @@ app.use('/improve-summary',     perClientIdLimiter);
 app.use('/generate-pdf',        perClientIdLimiter);
 app.use('/analyze-job-match',   perClientIdLimiter);
 app.use('/optimize-for-job',    perClientIdLimiter);
+
+// ─── Premium gating: login required + shared daily quota (Pro = unlimited) ───
+// Free tier: must be signed in; a single per-user daily allowance is shared
+// across AI Style / Job Match / AI Review. Downloads are Pro-only. This is the
+// server-side source of truth — the frontend gating is UX, this is enforcement.
+const FREE_DAILY_QUOTA = parseInt(process.env.FREE_DAILY_QUOTA || '2', 10);
+
+// Any premium action requires a valid signed-in user (free or pro).
+function requirePremiumAuth(req, res, next) {
+    const header = req.headers['authorization'] || '';
+    const token  = header.startsWith('Bearer ') ? header.slice(7) : null;
+    if (!token) return res.status(401).json({ error: 'Please sign in to use this feature.', code: 'AUTH_REQUIRED' });
+    try { req.user = jwt.verify(token, JWT_SECRET); return next(); }
+    catch (_) { return res.status(401).json({ error: 'Session expired. Please sign in again.', code: 'AUTH_REQUIRED' }); }
+}
+
+// Shared per-user daily quota across premium AI actions. Pro = unlimited.
+// Checks before the handler (no wasted AI spend); counts only successful
+// responses (a failed/validation-error request does not consume an allowance).
+async function enforceDailyQuota(req, res, next) {
+    if (!db) return next(); // no DB configured (dev) — cannot enforce
+    try {
+        const r = await db.query(
+            `SELECT plan,
+                    CASE WHEN daily_premium_date = CURRENT_DATE THEN daily_premium_count ELSE 0 END AS used
+             FROM rn_users WHERE id = $1`,
+            [req.user.id]
+        );
+        if (!r.rows.length) return res.status(401).json({ error: 'Account not found.', code: 'AUTH_REQUIRED' });
+        const plan  = r.rows[0].plan;
+        const used  = r.rows[0].used;
+        const isPro = plan === 'pro';
+
+        if (!isPro && used >= FREE_DAILY_QUOTA) {
+            return res.status(402).json({
+                error: `You've used your ${FREE_DAILY_QUOTA} free actions for today. Upgrade to Pro for unlimited access.`,
+                code: 'QUOTA_EXCEEDED', plan, used, limit: FREE_DAILY_QUOTA
+            });
+        }
+
+        res.setHeader('X-Quota-Plan',  plan);
+        res.setHeader('X-Quota-Limit', String(FREE_DAILY_QUOTA));
+        res.setHeader('X-Quota-Used',  String(isPro ? used : used + 1));
+
+        if (!isPro) {
+            res.on('finish', () => {
+                if (res.statusCode >= 200 && res.statusCode < 300) {
+                    db.query(
+                        `UPDATE rn_users SET
+                            daily_premium_count = CASE WHEN daily_premium_date = CURRENT_DATE THEN daily_premium_count + 1 ELSE 1 END,
+                            daily_premium_date  = CURRENT_DATE
+                         WHERE id = $1`,
+                        [req.user.id]
+                    ).catch(e => console.error('[QUOTA] increment failed:', e.message));
+                }
+            });
+        }
+        return next();
+    } catch (e) {
+        console.error('[QUOTA] check failed (fail-open):', e.message);
+        return next(); // don't block during a DB hiccup
+    }
+}
+
+// Pro-only — used for downloads. Free users get a watermarked+blurred preview
+// on the client and are blocked here from producing a real file.
+async function requirePro(req, res, next) {
+    if (!db) return next();
+    try {
+        const r = await db.query('SELECT plan FROM rn_users WHERE id = $1', [req.user.id]);
+        const plan = (r.rows[0] && r.rows[0].plan) || 'free';
+        if (plan !== 'pro') {
+            return res.status(402).json({
+                error: 'Downloading is a Pro feature. Upgrade to download your resume without a watermark.',
+                code: 'PRO_REQUIRED', plan
+            });
+        }
+        return next();
+    } catch (e) {
+        console.error('[PRO] check failed (fail-open):', e.message);
+        return next();
+    }
+}
+
+app.use('/generate-template',   requirePremiumAuth, enforceDailyQuota);
+app.use('/analyze-job-match',   requirePremiumAuth, enforceDailyQuota);
+app.use('/review-resume',       requirePremiumAuth, enforceDailyQuota);
+app.use('/generate-pdf',        requirePremiumAuth, requirePro);
 
 // Payment endpoints - rate limited + session validated
 app.use('/create-order',        paymentLimiter);
