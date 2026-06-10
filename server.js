@@ -74,7 +74,7 @@ app.use(
 );
 
 // --- Version marker ---------------------------------------------------------
-const SERVER_VERSION = 'v11.2-coach-2026';
+const SERVER_VERSION = 'v11.3-coach-2026';
 const BOOT_TIME      = Date.now();
 
 // --- Auth config ------------------------------------------------------------
@@ -118,6 +118,9 @@ if (process.env.DATABASE_URL) {
         -- Shared per-user daily premium-action quota (free tier). Pro = unlimited.
         ALTER TABLE rn_users ADD COLUMN IF NOT EXISTS daily_premium_count INTEGER DEFAULT 0;
         ALTER TABLE rn_users ADD COLUMN IF NOT EXISTS daily_premium_date  DATE;
+        -- Entitlement grants (Pro + Coach) stamp updated_at; column was missing,
+        -- which silently failed every plan grant after payment. Add it.
+        ALTER TABLE rn_users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
         CREATE TABLE IF NOT EXISTS rn_saved_resumes (
             id             UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
             user_id        UUID         NOT NULL REFERENCES rn_users(id) ON DELETE CASCADE,
