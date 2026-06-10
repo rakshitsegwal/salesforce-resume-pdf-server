@@ -74,7 +74,7 @@ app.use(
 );
 
 // --- Version marker ---------------------------------------------------------
-const SERVER_VERSION = 'v10-tokens-2026';
+const SERVER_VERSION = 'v10.1-tokens-2026';
 const BOOT_TIME      = Date.now();
 
 // --- Auth config ------------------------------------------------------------
@@ -477,11 +477,13 @@ html, body {
 }
 
 /* -- 9. Sections and content: all visible, auto height ------------------ */
+/* NOTE: .rb-skills is deliberately NOT in this group - forcing display:block
+   on it kills the flex context and the pills wrap mid-word. It gets its own
+   flex rule below (9b). */
 .rb-resume__section,
 .rb-resume .rb-exp-item,
 .rb-resume .rb-edu-item,
 .rb-resume .rb-cert,
-.rb-resume .rb-skills,
 .rb-resume .rb-summary {
     overflow: visible !important;
     height: auto !important;
@@ -489,6 +491,27 @@ html, body {
     position: relative !important;
     display: block !important;
     float: none !important;
+}
+
+/* -- 9b. Skills: keep the pill row as a wrapping flex row, pills intact -- */
+.rb-resume .rb-skills {
+    display: flex !important;
+    flex-wrap: wrap !important;
+    gap: 4px !important;
+    align-content: flex-start !important;
+    overflow: visible !important;
+    height: auto !important;
+    min-height: 0 !important;
+    position: relative !important;
+    float: none !important;
+}
+.rb-resume .rb-skill-pill {
+    display: inline-flex !important;
+    align-items: center !important;
+    white-space: nowrap !important;
+    overflow: visible !important;
+    height: auto !important;
+    flex: 0 0 auto !important;
 }
 
 /* -- 10. Bullet lists: prevent overlap with list markers ---------------- */
@@ -620,30 +643,29 @@ app.post('/generate-pdf', async (req, res) => {
                 if (node) forceAuto(node);
             });
 
-            // 3. Four measurement strategies - take the MAX
-            // Strategy A: document scrollHeight (reliable for block layouts)
-            const mA = document.documentElement.scrollHeight;
+            // 3. Measure the RESUME ELEMENT's true content height, relative to
+            // its own top. We deliberately do NOT use
+            // document.documentElement.scrollHeight: it is floored at the
+            // viewport height (set to 2000 above), so any resume shorter than
+            // that gets padded out to ~2000px, leaving a long blank tail.
+            const top = el.getBoundingClientRect().top;
 
-            // Strategy B: max getBoundingClientRect().bottom across ALL descendants
-            // Reliable for grid/flex layouts where container height != content height
+            // Strategy B: lowest point of any descendant, relative to the resume
+            // top. Robust for grid/flex where the container's own height reads 0
+            // (child boxes still report correct bottoms, even past the fold).
             let mB = 0;
             el.querySelectorAll('*').forEach(child => {
                 const r = child.getBoundingClientRect();
-                if (r && r.bottom > mB) mB = r.bottom;
+                const bottom = r.bottom - top;
+                if (bottom > mB) mB = bottom;
             });
 
-            // Strategy C: offsetTop + offsetHeight - works when BoundingClientRect clips
-            let mC = 0;
-            el.querySelectorAll('*').forEach(child => {
-                const bot = (child.offsetTop || 0) + (child.offsetHeight || 0);
-                if (bot > mC) mC = bot;
-            });
+            // Strategy D: the resume element's own box height after forcing auto.
+            const mD = Math.max(el.scrollHeight, el.getBoundingClientRect().height);
 
-            // Strategy D: resume element's own scrollHeight after forcing auto
-            const mD = el.scrollHeight;
-
-            const measured = Math.max(mA, mB, mC, mD, 400);
-            console.log('[PDF-HEIGHT] A=' + mA + ' B=' + mB + ' C=' + mC + ' D=' + mD + ' -> ' + measured);
+            // +8px guards against sub-pixel clipping of the final line.
+            const measured = Math.ceil(Math.max(mB, mD, 400)) + 8;
+            console.log('[PDF-HEIGHT] B=' + Math.ceil(mB) + ' D=' + Math.ceil(mD) + ' -> ' + measured);
             return measured;
         });
 
