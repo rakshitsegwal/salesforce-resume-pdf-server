@@ -74,7 +74,7 @@ app.use(
 );
 
 // --- Version marker ---------------------------------------------------------
-const SERVER_VERSION = 'v11.1-coach-2026';
+const SERVER_VERSION = 'v11.2-coach-2026';
 const BOOT_TIME      = Date.now();
 
 // --- Auth config ------------------------------------------------------------
@@ -2125,6 +2125,9 @@ app.post('/verify-payment', async (req, res) => {
         const coach = plan && plan.coach; // 'unlimited' | 'pass' | undefined
         console.log(`[${SERVER_VERSION}] grant → user=${grantUserId} plan=${planId} coach=${coach || 'none'}`);
 
+        // Grant outcome is echoed in the response (debug) so the client can show
+        // exactly what happened if entitlement doesn't appear to save.
+        const grantInfo = { user: grantUserId || null, coach: coach || 'none', rows: null, error: null };
         if (grantUserId && db) {
             try {
                 const expiresAt = planId.includes('yearly')
@@ -2145,11 +2148,14 @@ app.post('/verify-payment', async (req, res) => {
                     rc = r.rowCount;
                     console.log(`[${SERVER_VERSION}] Pro granted (rows=${rc})`);
                 }
+                grantInfo.rows = rc;
                 if (rc === 0) console.error(`[${SERVER_VERSION}] GRANT MATCHED 0 ROWS — user id not found: ${grantUserId}`);
             } catch (dbErr) {
+                grantInfo.error = dbErr.message;
                 console.error(`[${SERVER_VERSION}] DB grant failed:`, dbErr.message);
             }
         } else {
+            grantInfo.error = 'no-grant-user-or-db';
             console.error(`[${SERVER_VERSION}] NO grantUserId — entitlement NOT saved (body userId=${userId})`);
         }
 
@@ -2157,7 +2163,8 @@ app.post('/verify-payment', async (req, res) => {
             success:    true,
             payment_id: razorpay_payment_id,
             order_id:   razorpay_order_id,
-            plan:       planId
+            plan:       planId,
+            grant:      grantInfo
         });
 
     } catch (err) {
