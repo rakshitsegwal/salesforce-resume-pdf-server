@@ -74,7 +74,7 @@ app.use(
 );
 
 // --- Version marker ---------------------------------------------------------
-const SERVER_VERSION = 'v10.1-tokens-2026';
+const SERVER_VERSION = 'v11-coach-2026';
 const BOOT_TIME      = Date.now();
 
 // --- Auth config ------------------------------------------------------------
@@ -149,6 +149,33 @@ if (process.env.DATABASE_URL) {
             created_at TIMESTAMPTZ  DEFAULT NOW()
         );
         CREATE INDEX IF NOT EXISTS idx_rn_magic_token ON rn_magic_tokens(token);
+
+        -- ── Interview Coach ──────────────────────────────────────────────
+        -- Coach entitlement is separate from the résumé 'plan' (free/pro):
+        -- 'unlimited' subscription, or a count of one-time session passes.
+        ALTER TABLE rn_users ADD COLUMN IF NOT EXISTS coach_plan     VARCHAR(20) DEFAULT 'none';
+        ALTER TABLE rn_users ADD COLUMN IF NOT EXISTS coach_expires  TIMESTAMPTZ;
+        ALTER TABLE rn_users ADD COLUMN IF NOT EXISTS session_passes INTEGER DEFAULT 0;
+        CREATE TABLE IF NOT EXISTS rn_interview_sessions (
+            id              UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+            user_id         UUID         NOT NULL REFERENCES rn_users(id) ON DELETE CASCADE,
+            company         VARCHAR(255),
+            job_title       VARCHAR(255),
+            job_description  TEXT,
+            interview_type  VARCHAR(50),
+            difficulty      INTEGER      DEFAULT 60,
+            mode            VARCHAR(20)  DEFAULT 'voice',
+            resume_snapshot JSONB,
+            questions       JSONB        DEFAULT '[]'::jsonb,
+            answers         JSONB        DEFAULT '[]'::jsonb,
+            report          JSONB,
+            overall_score   INTEGER,
+            status          VARCHAR(20)  DEFAULT 'in_progress',
+            created_at      TIMESTAMPTZ  DEFAULT NOW(),
+            updated_at      TIMESTAMPTZ  DEFAULT NOW(),
+            completed_at    TIMESTAMPTZ
+        );
+        CREATE INDEX IF NOT EXISTS idx_rn_sessions_user ON rn_interview_sessions(user_id, created_at DESC);
     `)
     .then(() => console.log('[DB] Schema ready'))
     .catch(e => console.error('[DB] Schema init:', e.message));
@@ -2008,7 +2035,11 @@ const PLANS = {
     pro_monthly:  { amount: 59900,  label: 'Pro Monthly',  currency: 'INR' },
     pro_yearly:   { amount: 598800, label: 'Pro Yearly',   currency: 'INR' },
     team_monthly: { amount: 179900, label: 'Team Monthly', currency: 'INR' },
-    team_yearly:  { amount: 1798800,label: 'Team Yearly',  currency: 'INR' }
+    team_yearly:  { amount: 1798800,label: 'Team Yearly',  currency: 'INR' },
+    // Interview Coach (INR equivalents of $19/mo · $13/mo-yearly · $7 session)
+    coach_unlimited:        { amount: 159900,  label: 'Coach Unlimited',        currency: 'INR', coach: 'unlimited' },
+    coach_unlimited_yearly: { amount: 1318800, label: 'Coach Unlimited (yr)',   currency: 'INR', coach: 'unlimited' },
+    session_pass:           { amount: 59900,   label: 'Coach Session Pass',     currency: 'INR', coach: 'pass' }
 };
 
 // POST /create-order
@@ -2088,13 +2119,26 @@ app.post('/verify-payment', async (req, res) => {
                     ? new Date(Date.now() + 365 * 24 * 60 * 60 * 1000)
                     : new Date(Date.now() + 30  * 24 * 60 * 60 * 1000);
 
-                await db.query(
-                    `UPDATE rn_users
-                     SET plan = 'pro', updated_at = NOW()
-                     WHERE id = $1`,
-                    [userId]
-                );
-                console.log(`[${SERVER_VERSION}] User ${userId} upgraded to pro until ${expiresAt}`);
+                const coach = plan && plan.coach; // 'unlimited' | 'pass' | undefined
+                if (coach === 'unlimited') {
+                    await db.query(
+                        `UPDATE rn_users SET coach_plan='unlimited', coach_expires=$2, updated_at=NOW() WHERE id=$1`,
+                        [userId, expiresAt]
+                    );
+                    console.log(`[${SERVER_VERSION}] User ${userId} → Coach Unlimited until ${expiresAt}`);
+                } else if (coach === 'pass') {
+                    await db.query(
+                        `UPDATE rn_users SET session_passes = COALESCE(session_passes,0) + 1, updated_at=NOW() WHERE id=$1`,
+                        [userId]
+                    );
+                    console.log(`[${SERVER_VERSION}] User ${userId} → +1 Coach Session Pass`);
+                } else {
+                    await db.query(
+                        `UPDATE rn_users SET plan = 'pro', updated_at = NOW() WHERE id = $1`,
+                        [userId]
+                    );
+                    console.log(`[${SERVER_VERSION}] User ${userId} upgraded to pro until ${expiresAt}`);
+                }
             } catch (dbErr) {
                 // DB update failed - log but don't fail the response
                 // Payment was real; retry upgrade on next login
@@ -2112,6 +2156,199 @@ app.post('/verify-payment', async (req, res) => {
     } catch (err) {
         console.error(`[${SERVER_VERSION}] verify-payment error:`, err.message);
         res.status(500).json({ error: 'Payment verification failed' });
+    }
+});
+
+
+// ============================================================================
+// INTERVIEW COACH — sessions, AI interview engine, scoring
+// ============================================================================
+// All Coach endpoints require a signed-in user (requireAuth) + the shared API
+// secret. Starting a session also requires Coach entitlement (Unlimited sub or
+// a Session Pass) — consumed on start. Sessions are owned per-user.
+
+const COACH_TYPES = ['Behavioral', 'Technical', 'Mixed', 'System design', 'Case'];
+
+function coachAccess(u) {
+    const unlimited = u && u.coach_plan === 'unlimited' &&
+        (!u.coach_expires || new Date(u.coach_expires) > new Date());
+    const passes = (u && u.session_passes) || 0;
+    return { unlimited, passes, has: unlimited || passes > 0 };
+}
+
+// Generate interview questions tailored to the résumé + JD + config.
+async function coachGenerateQuestions({ resumeString, company, jobTitle, jobDescription, interviewType, difficulty, count }) {
+    const sys = `You are an elite interviewer running a realistic ${interviewType} interview for the role below.
+Generate exactly ${count} questions, ordered from warm-up to hardest, tailored to THIS candidate's résumé and THIS job.
+Difficulty ${difficulty}/100 (higher = sharper, more probing, more quantitative).
+Questions must reference the candidate's actual experience and the job's real requirements — never generic.
+Return ONLY JSON: {"questions":[{"text":"...","focus":"2-4 word tag","hint":"the single key phrase in the question to emphasise"}]}`;
+    const user = `=== ROLE ===\n${sanitizeInput(jobTitle)} at ${sanitizeInput(company)}\n\n=== JOB DESCRIPTION ===\n${truncateText(jobDescription, 4000)}\n\n=== CANDIDATE RÉSUMÉ ===\n${truncateText(resumeString, 6000)}\n\nReturn ${count} questions as JSON.`;
+    const c = await openai.chat.completions.create({
+        model: 'gpt-4.1-mini', temperature: 0.6, max_tokens: 1200,
+        response_format: { type: 'json_object' },
+        messages: [{ role: 'system', content: sys }, { role: 'user', content: user }],
+    });
+    const parsed = JSON.parse(c.choices[0].message.content);
+    const qs = Array.isArray(parsed.questions) ? parsed.questions.slice(0, count) : [];
+    return qs.map((q, i) => ({ id: 'q' + (i + 1), text: String(q.text || '').slice(0, 400), focus: q.focus || '', hint: q.hint || '' }));
+}
+
+// Score the completed interview → the structured report the UI renders.
+async function coachScore({ resumeString, jobTitle, company, jobDescription, qa }) {
+    const sys = `You are a brutally specific interview coach. Score this completed ${qa.length}-question interview.
+Be concrete and tied to what the candidate ACTUALLY said. No vague praise.
+Return ONLY JSON with this exact shape:
+{
+ "overall": <int 0-100>,
+ "verdict": {"headline":"<6-8 words>","summary":"<2-3 sentence verdict>"},
+ "percentile": "<e.g. Top 25%>",
+ "dimensions": [
+   {"key":"Communication","score":<0-100>,"note":"<<=12 words>"},
+   {"key":"Confidence","score":<0-100>,"note":"<<=12 words>"},
+   {"key":"Structure","score":<0-100>,"note":"<<=12 words>"},
+   {"key":"Technical relevance","score":<0-100>,"note":"<<=12 words>"}
+ ],
+ "strengths": [{"title":"<short>","detail":"<1 sentence tied to an answer>"}],
+ "weaknesses": [{"title":"<short>","detail":"<1 sentence, actionable>"}],
+ "fixes": [{"questionId":"qN","tag":"<Qn · topic>","score":<0-100>,"quote":"<paraphrase of what they said>","rewrite":"<stronger version; wrap the key upgrade in {curly braces}>"}],
+ "recommendations": ["<imperative next step>"]
+}
+Give 3 strengths, 3 weaknesses, the 2 weakest answers as fixes, and 3 recommendations.`;
+    const transcript = qa.map((x, i) => `Q${i + 1} (${x.focus || 'general'}): ${x.text}\nANSWER: ${x.answer || '(skipped)'}`).join('\n\n');
+    const user = `=== ROLE ===\n${sanitizeInput(jobTitle)} at ${sanitizeInput(company)}\n\n=== RÉSUMÉ ===\n${truncateText(resumeString, 4000)}\n\n=== TRANSCRIPT ===\n${truncateText(transcript, 8000)}\n\nScore it. Return JSON only.`;
+    const c = await openai.chat.completions.create({
+        model: 'gpt-4.1-mini', temperature: 0.3, max_tokens: 1800,
+        response_format: { type: 'json_object' },
+        messages: [{ role: 'system', content: sys }, { role: 'user', content: user }],
+    });
+    const r = JSON.parse(c.choices[0].message.content);
+    r.overall = Math.max(0, Math.min(100, Math.round(r.overall || 0)));
+    (r.dimensions || []).forEach(d => { d.score = Math.max(0, Math.min(100, Math.round(d.score || 0))); });
+    return r;
+}
+
+// All /coach endpoints share the API secret + require a signed-in user.
+app.use('/coach', validateApiSecret);
+
+// Coach entitlement status (frontend uses this to gate UI / route to checkout).
+app.get('/coach/me', requireAuth, async (req, res) => {
+    if (!db) return res.json({ unlimited: false, passes: 0, has: false });
+    try {
+        const r = await db.query('SELECT coach_plan, coach_expires, session_passes FROM rn_users WHERE id=$1', [req.user.id]);
+        return res.json(coachAccess(r.rows[0] || {}));
+    } catch (e) { return res.status(500).json({ error: 'Failed to load Coach status.' }); }
+});
+
+// Create a session (consumes entitlement) and generate the questions.
+app.post('/coach/sessions', requireAuth, async (req, res) => {
+    if (!db) return res.status(503).json({ error: 'Coach not configured.' });
+    try {
+        const { resumeData, company, jobTitle, jobDescription, interviewType, difficulty, mode, length } = req.body;
+        if (!jobDescription || jobDescription.trim().length < 30) return res.status(400).json({ error: 'Add a job description (min 30 chars).' });
+
+        // Entitlement: Unlimited → allow; else consume one Session Pass; else gate.
+        const ur = await db.query('SELECT coach_plan, coach_expires, session_passes FROM rn_users WHERE id=$1', [req.user.id]);
+        const acc = coachAccess(ur.rows[0] || {});
+        if (!acc.has) return res.status(402).json({ error: 'The Interview Coach is a premium feature. Choose a plan to start.', code: 'PRO_REQUIRED' });
+        if (!acc.unlimited) {
+            const dec = await db.query('UPDATE rn_users SET session_passes = session_passes - 1 WHERE id=$1 AND session_passes > 0', [req.user.id]);
+            if (!dec.rowCount) return res.status(402).json({ error: 'No session passes left.', code: 'PRO_REQUIRED' });
+        }
+
+        const type  = COACH_TYPES.includes(interviewType) ? interviewType : 'Behavioral';
+        const count = [5, 6, 10].includes(length) ? length : 6;
+        const diff  = Math.max(0, Math.min(100, parseInt(difficulty, 10) || 60));
+        const resumeString = serializeResumeData(resumeData);
+
+        let questions = [];
+        try {
+            questions = await coachGenerateQuestions({ resumeString, company, jobTitle, jobDescription, interviewType: type, difficulty: diff, count });
+        } catch (aiErr) {
+            console.error('[coach] question gen failed:', aiErr.message);
+            return res.status(502).json({ error: 'Could not generate questions. Please try again.' });
+        }
+
+        const ins = await db.query(
+            `INSERT INTO rn_interview_sessions(user_id,company,job_title,job_description,interview_type,difficulty,mode,resume_snapshot,questions,status)
+             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'in_progress') RETURNING id, questions`,
+            [req.user.id, company || '', jobTitle || '', jobDescription, type, diff, mode === 'text' ? 'text' : 'voice', resumeData || null, JSON.stringify(questions)]
+        );
+        console.log(`[${SERVER_VERSION}] [coach] session ${ins.rows[0].id} created (${type}, ${count}Q, ${mode})`);
+        res.json({ id: ins.rows[0].id, questions });
+    } catch (e) {
+        console.error('[coach] create error:', e.message);
+        res.status(500).json({ error: 'Failed to start interview.' });
+    }
+});
+
+// List the user's sessions (history).
+app.get('/coach/sessions', requireAuth, async (req, res) => {
+    if (!db) return res.json({ sessions: [] });
+    try {
+        const r = await db.query(
+            `SELECT id, company, job_title, interview_type, mode, overall_score, status, created_at
+             FROM rn_interview_sessions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 100`, [req.user.id]);
+        res.json({ sessions: r.rows });
+    } catch (e) { res.status(500).json({ error: 'Failed to load history.' }); }
+});
+
+// Fetch a single owned session.
+app.get('/coach/sessions/:id', requireAuth, async (req, res) => {
+    if (!db) return res.status(503).json({ error: 'Coach not configured.' });
+    try {
+        const r = await db.query('SELECT * FROM rn_interview_sessions WHERE id=$1 AND user_id=$2', [req.params.id, req.user.id]);
+        if (!r.rows.length) return res.status(404).json({ error: 'Session not found.' });
+        res.json(r.rows[0]);
+    } catch (e) { res.status(500).json({ error: 'Failed to load session.' }); }
+});
+
+// Submit an answer to a question.
+app.post('/coach/sessions/:id/answers', requireAuth, async (req, res) => {
+    if (!db) return res.status(503).json({ error: 'Coach not configured.' });
+    try {
+        const { questionId, text } = req.body;
+        const r = await db.query('SELECT answers FROM rn_interview_sessions WHERE id=$1 AND user_id=$2', [req.params.id, req.user.id]);
+        if (!r.rows.length) return res.status(404).json({ error: 'Session not found.' });
+        const answers = Array.isArray(r.rows[0].answers) ? r.rows[0].answers : [];
+        answers.push({ questionId: String(questionId || ''), text: truncateText(text, 6000), at: new Date().toISOString() });
+        await db.query('UPDATE rn_interview_sessions SET answers=$1, updated_at=NOW() WHERE id=$2', [JSON.stringify(answers), req.params.id]);
+        res.json({ ok: true, answered: answers.length });
+    } catch (e) { res.status(500).json({ error: 'Failed to save answer.' }); }
+});
+
+// Generate the scored report.
+app.post('/coach/sessions/:id/score', requireAuth, async (req, res) => {
+    if (!db) return res.status(503).json({ error: 'Coach not configured.' });
+    try {
+        const r = await db.query('SELECT * FROM rn_interview_sessions WHERE id=$1 AND user_id=$2', [req.params.id, req.user.id]);
+        if (!r.rows.length) return res.status(404).json({ error: 'Session not found.' });
+        const s = r.rows[0];
+        if (s.report) return res.json({ report: s.report, overall: s.overall_score }); // idempotent
+
+        const questions = Array.isArray(s.questions) ? s.questions : [];
+        const answers   = Array.isArray(s.answers) ? s.answers : [];
+        const qa = questions.map(q => ({
+            focus: q.focus, text: q.text,
+            answer: (answers.find(a => a.questionId === q.id) || {}).text || ''
+        }));
+        const resumeString = serializeResumeData(s.resume_snapshot);
+        let report;
+        try {
+            report = await coachScore({ resumeString, jobTitle: s.job_title, company: s.company, jobDescription: s.job_description, qa });
+        } catch (aiErr) {
+            console.error('[coach] scoring failed:', aiErr.message);
+            return res.status(502).json({ error: 'Could not score the interview. Please try again.' });
+        }
+        await db.query(
+            `UPDATE rn_interview_sessions SET report=$1, overall_score=$2, status='scored', completed_at=NOW(), updated_at=NOW() WHERE id=$3`,
+            [JSON.stringify(report), report.overall, s.id]
+        );
+        console.log(`[${SERVER_VERSION}] [coach] session ${s.id} scored → ${report.overall}`);
+        res.json({ report, overall: report.overall });
+    } catch (e) {
+        console.error('[coach] score error:', e.message);
+        res.status(500).json({ error: 'Failed to generate report.' });
     }
 });
 
