@@ -38,7 +38,7 @@ app.use(cors({
 // Body size: 10mb handles base64 images but limits abuse headroom
 app.use(express.json({ limit: '10mb' }));
 
-// ─── Request ID + logger ─────────────────────────────────────────────────────
+// --- Request ID + logger ----------------------------------------------------
 app.use((req, res, next) => {
     const reqId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2,7)}`;
     res.setHeader('X-Request-ID', reqId);
@@ -58,7 +58,7 @@ app.use((req, res, next) => {
     next();
 });
 
-// Extend server response timeout to 120s — inspiration flow makes 2 OpenAI calls
+// Extend server response timeout to 120s - inspiration flow makes 2 OpenAI calls
 app.use((req, res, next) => {
     res.setTimeout(120000, () => {
         res.status(503).json({ error: 'Request timed out. Please try again.' });
@@ -73,11 +73,11 @@ app.use(
     })
 );
 
-// ─── Version marker ───────────────────────────────────────────────────────────
-const SERVER_VERSION = 'v9-auth-2026';
+// --- Version marker ---------------------------------------------------------
+const SERVER_VERSION = 'v10-tokens-2026';
 const BOOT_TIME      = Date.now();
 
-// ─── Auth config ──────────────────────────────────────────────────────────────
+// --- Auth config ------------------------------------------------------------
 const JWT_SECRET     = process.env.JWT_SECRET     || 'CHANGE_ME_32_CHAR_RANDOM_SECRET';
 const JWT_EXPIRES    = '30d';
 const FRONTEND_URL   = process.env.FRONTEND_URL   || 'https://developwithrax-dev-ed.my.site.com';
@@ -87,7 +87,7 @@ const GOOGLE_SECRET  = process.env.GOOGLE_CLIENT_SECRET || '';
 const LINKEDIN_ID    = process.env.LINKEDIN_CLIENT_ID   || '';
 const LINKEDIN_SEC   = process.env.LINKEDIN_CLIENT_SECRET || '';
 
-// ─── PostgreSQL pool ──────────────────────────────────────────────────────────
+// --- PostgreSQL pool --------------------------------------------------------
 let db = null;
 if (process.env.DATABASE_URL) {
     db = new Pool({
@@ -150,10 +150,10 @@ if (process.env.DATABASE_URL) {
     .then(() => console.log('[DB] Schema ready'))
     .catch(e => console.error('[DB] Schema init:', e.message));
 } else {
-    console.warn('[DB] DATABASE_URL not set — auth disabled');
+    console.warn('[DB] DATABASE_URL not set - auth disabled');
 }
 
-// ─── Email transporter ────────────────────────────────────────────────────────
+// --- Email transporter ------------------------------------------------------
 let mailer = null;
 if (process.env.RESEND_API_KEY) {
     mailer = nodemailer.createTransport({
@@ -169,7 +169,7 @@ if (process.env.RESEND_API_KEY) {
     });
 }
 
-// ─── IP-based rate limiters (first line of defence) ─────────────────────────
+// --- IP-based rate limiters (first line of defence) -------------------------
 const aiLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,   // 15 minutes
     max: 20,                     // 20 AI calls per IP per window
@@ -184,7 +184,7 @@ const exportLimiter = rateLimit({
     message: { error: 'PDF export limit reached. Please try again later.' }
 });
 
-// Payment endpoints — strict limits to prevent API probing / forged-sig attacks
+// Payment endpoints - strict limits to prevent API probing / forged-sig attacks
 const paymentLimiter = rateLimit({
     windowMs: 60 * 60 * 1000,   // 1 hour
     max: 10,                     // max 10 order creations per IP per hour
@@ -192,7 +192,7 @@ const paymentLimiter = rateLimit({
     message: { error: 'Too many payment requests. Please try again later.' }
 });
 
-// Magic link — strict to prevent email spam abuse
+// Magic link - strict to prevent email spam abuse
 const magicLinkLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,   // 15 minutes
     max: 5,                      // 5 magic link requests per IP per 15 min
@@ -200,17 +200,17 @@ const magicLinkLimiter = rateLimit({
     message: { error: 'Too many email requests. Please wait 15 minutes.' }
 });
 
-// Auth polling — light limit to prevent nonce enumeration
+// Auth polling - light limit to prevent nonce enumeration
 const pollLimiter = rateLimit({
     windowMs: 5 * 60 * 1000,
     max: 60,                     // 60 polls per 5 min (polling every 1.5s for up to 5 min = ~200 max)
     message: { error: 'Too many poll requests.' }
 });
 
-// ─── Per-clientId rate limiter (second line of defence) ──────────────────────
+// --- Per-clientId rate limiter (second line of defence) ---------------------
 // Prevents abuse from users who rotate IPs but keep the same browser session.
 // Uses an in-memory Map; resets on server restart.
-const clientIdCalls = new Map();   // clientId → { count, windowStart }
+const clientIdCalls = new Map();   // clientId -> { count, windowStart }
 const CLIENT_ID_LIMIT        = 15; // max AI calls per clientId per window
 const CLIENT_ID_WINDOW_MS    = 15 * 60 * 1000; // 15 minutes
 
@@ -246,7 +246,7 @@ setInterval(() => {
     }
 }, 30 * 60 * 1000);
 
-// ── API secret check — applied to all protected endpoints ────────────────────
+// -- API secret check - applied to all protected endpoints -------------------
 // Rejects any request that doesn't include the correct x-api-secret header.
 // This blocks direct API scraping even if someone finds the Railway URL.
 app.use('/generate-template',   validateApiSecret);
@@ -281,7 +281,7 @@ app.use('/generate-pdf',        validateClientSession);
 app.use('/analyze-job-match',   validateClientSession);
 app.use('/optimize-for-job',    validateClientSession);
 
-// Per-clientId limits (second layer — catches proxy rotators)
+// Per-clientId limits (second layer - catches proxy rotators)
 app.use('/generate-template',   perClientIdLimiter);
 app.use('/extract-resume',      perClientIdLimiter);
 app.use('/review-resume',       perClientIdLimiter);
@@ -290,20 +290,20 @@ app.use('/generate-pdf',        perClientIdLimiter);
 app.use('/analyze-job-match',   perClientIdLimiter);
 app.use('/optimize-for-job',    perClientIdLimiter);
 
-// Payment endpoints — rate limited + session validated
+// Payment endpoints - rate limited + session validated
 app.use('/create-order',        paymentLimiter);
 app.use('/create-order',        validateClientSession);
 app.use('/verify-payment',      paymentLimiter);
 app.use('/verify-payment',      validateClientSession);
 
-// Magic link — rate limited to prevent email spam
+// Magic link - rate limited to prevent email spam
 app.use('/auth/magic-link/request', magicLinkLimiter);
 
-// Auth polling — light rate limit
+// Auth polling - light rate limit
 app.use('/auth/poll',           pollLimiter);
 app.use('/auth/init-poll',      pollLimiter);
 
-// ─── Health / version ─────────────────────────────────────────────────────────
+// --- Health / version -------------------------------------------------------
 app.get('/version', (req, res) => {
     res.json({
         version:  SERVER_VERSION,
@@ -312,13 +312,13 @@ app.get('/version', (req, res) => {
     });
 });
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// --- Helpers ----------------------------------------------------------------
 
 // Accepts: standard UUID (36 chars), or UUID-with-extras (up to 72 chars)
 // Rejects: SQL injection strings, script tags, arbitrary text
 const CLIENT_ID_PATTERN = /^[a-zA-Z0-9\-_]{8,72}$/;
 
-// ─── Shared API secret — first line of defence against external scraping ──────
+// --- Shared API secret - first line of defence against external scraping -----
 // Set RENONYM_API_SECRET in Railway env vars (any long random string, 32+ chars)
 // Frontend sends it as x-api-secret header (via VITE_API_SECRET env var)
 const API_SECRET = process.env.RENONYM_API_SECRET || null;
@@ -329,7 +329,7 @@ function validateApiSecret(req, res, next) {
 
     const provided = req.headers['x-api-secret'];
     if (!provided || provided !== API_SECRET) {
-        console.warn(`[API-SECRET] Rejected request — invalid secret. IP=${req.ip} path=${req.path}`);
+        console.warn(`[API-SECRET] Rejected request - invalid secret. IP=${req.ip} path=${req.path}`);
         return res.status(401).json({ error: 'Unauthorised.' });
     }
     next();
@@ -358,12 +358,12 @@ function sanitizeInput(value) {
         .trim();
 }
 
-// ─── PDF override CSS — BULLETPROOF VERSION ──────────────────────────────────
-// Rules are ordered: base → structural → content → color-print
-// Every rule uses !important to win over any app/token/AI CSS.
+// --- PDF override CSS - BULLETPROOF VERSION ---------------------------------
+// Rules are ordered: base -> structural -> content -> color-print
+// Every rule uses !important to win over any app/token CSS.
 const PDF_OVERRIDE_CSS = `
 
-/* ── 1. Page & body reset ──────────────────────────────────────────────── */
+/* -- 1. Page & body reset ------------------------------------------------ */
 html, body {
     margin: 0 !important; padding: 0 !important;
     background: #ffffff !important;
@@ -377,7 +377,7 @@ html, body {
     box-sizing: border-box !important;
 }
 
-/* ── 2. Remove all browser/app chrome that interferes with PDF ─────────── */
+/* -- 2. Remove all browser/app chrome that interferes with PDF ----------- */
 .rp-preview__scale-wrap,
 .rp-preview,
 .rp-builder,
@@ -386,7 +386,7 @@ html, body {
     margin: 0 !important; padding: 0 !important;
 }
 
-/* ── 3. Resume root ────────────────────────────────────────────────────── */
+/* -- 3. Resume root ------------------------------------------------------ */
 .rb-resume {
     position: relative !important;
     display: block !important;
@@ -405,7 +405,7 @@ html, body {
 }
 .rb-resume:hover { transform: none !important; }
 
-/* ── 4. Header: full-width strip, auto height ──────────────────────────── */
+/* -- 4. Header: full-width strip, auto height ---------------------------- */
 .rb-resume__header {
     position: relative !important;
     display: flex !important;
@@ -417,8 +417,8 @@ html, body {
     flex-shrink: 0 !important;
 }
 
-/* ── 5. Body grid: LOCKED to 2 columns, auto height ───────────────────── */
-/* This is the critical fix — prevents body from collapsing to 0 height    */
+/* -- 5. Body grid: LOCKED to 2 columns, auto height --------------------- */
+/* This is the critical fix - prevents body from collapsing to 0 height    */
 .rb-resume__body {
     display: grid !important;
     grid-template-columns: 210px 1fr !important;
@@ -431,7 +431,7 @@ html, body {
     float: none !important;
 }
 
-/* ── 6. Sidebar: left column, full stretch ─────────────────────────────── */
+/* -- 6. Sidebar: left column, full stretch ------------------------------ */
 .rb-resume__sidebar {
     grid-column: 1 / 2 !important;
     grid-row: 1 !important;
@@ -445,7 +445,7 @@ html, body {
     float: none !important;
 }
 
-/* ── 7. Main content: right column, full stretch ───────────────────────── */
+/* -- 7. Main content: right column, full stretch ------------------------ */
 .rb-resume__main {
     grid-column: 2 / 3 !important;
     grid-row: 1 !important;
@@ -459,7 +459,7 @@ html, body {
     float: none !important;
 }
 
-/* ── 8. Single-column layout (when layout != two-col) ──────────────────── */
+/* -- 8. Single-column layout (when layout != two-col) ------------------- */
 .rb-resume--layout-single .rb-resume__body,
 .rb-resume--layout-single-ai .rb-resume__body {
     display: block !important;
@@ -476,7 +476,7 @@ html, body {
     width: 100% !important;
 }
 
-/* ── 9. Sections and content: all visible, auto height ─────────────────── */
+/* -- 9. Sections and content: all visible, auto height ------------------ */
 .rb-resume__section,
 .rb-resume .rb-exp-item,
 .rb-resume .rb-edu-item,
@@ -491,7 +491,7 @@ html, body {
     float: none !important;
 }
 
-/* ── 10. Bullet lists: prevent overlap with list markers ───────────────── */
+/* -- 10. Bullet lists: prevent overlap with list markers ---------------- */
 .rb-resume .rb-exp-bullets {
     display: block !important;
     list-style: disc outside !important;
@@ -508,7 +508,7 @@ html, body {
     overflow-wrap: break-word !important;
 }
 
-/* ── 11. Prevent page breaks INSIDE key elements ───────────────────────── */
+/* -- 11. Prevent page breaks INSIDE key elements ------------------------ */
 .rb-resume__header,
 .rb-exp-item,
 .rb-edu-item {
@@ -516,7 +516,7 @@ html, body {
     page-break-inside: avoid !important;
 }
 
-/* ── 12. Color accuracy ────────────────────────────────────────────────── */
+/* -- 12. Color accuracy ------------------------------------------------- */
 .rb-resume__photo-placeholder,
 .rb-resume__top-deco,
 .rb-resume .rb-cert,
@@ -526,9 +526,9 @@ html, body {
 }
 `;
 
-// ═════════════════════════════════════════════════════════════════════════════
+// ----------------------------------------------------------------------------
 // POST /generate-pdf
-// ═════════════════════════════════════════════════════════════════════════════
+// ----------------------------------------------------------------------------
 // Strips dangerous HTML tags from PDF payload before Puppeteer renders it
 function sanitizePdfHtml(html) {
     if (!html) return '';
@@ -562,7 +562,7 @@ app.post('/generate-pdf', async (req, res) => {
         });
 
         const page = await browser.newPage();
-        // No deviceScaleFactor — causes coordinate issues with getBoundingClientRect
+        // No deviceScaleFactor - causes coordinate issues with getBoundingClientRect
         // Use a tall enough viewport so nothing is virtualized off-screen
         await page.setViewport({ width: 794, height: 2000, deviceScaleFactor: 1 });
 
@@ -590,7 +590,7 @@ app.post('/generate-pdf', async (req, res) => {
         // Settle: fonts + any deferred layout reflows
         await new Promise(r => setTimeout(r, 600));
 
-        // ── ROBUST HEIGHT MEASUREMENT ───────────────────────────────────────
+        // -- ROBUST HEIGHT MEASUREMENT -------------------------------------
         // Problem: CSS grid containers often report height:0 in scrollHeight
         // because grid children with `align-self: stretch` don't expand the container.
         // Fix: force-unlock every structural element, then take the MAX of
@@ -620,7 +620,7 @@ app.post('/generate-pdf', async (req, res) => {
                 if (node) forceAuto(node);
             });
 
-            // 3. Four measurement strategies — take the MAX
+            // 3. Four measurement strategies - take the MAX
             // Strategy A: document scrollHeight (reliable for block layouts)
             const mA = document.documentElement.scrollHeight;
 
@@ -632,7 +632,7 @@ app.post('/generate-pdf', async (req, res) => {
                 if (r && r.bottom > mB) mB = r.bottom;
             });
 
-            // Strategy C: offsetTop + offsetHeight — works when BoundingClientRect clips
+            // Strategy C: offsetTop + offsetHeight - works when BoundingClientRect clips
             let mC = 0;
             el.querySelectorAll('*').forEach(child => {
                 const bot = (child.offsetTop || 0) + (child.offsetHeight || 0);
@@ -647,7 +647,7 @@ app.post('/generate-pdf', async (req, res) => {
             return measured;
         });
 
-        // Raise cap to 5000px — supports dense 4-page resumes without clipping
+        // Raise cap to 5000px - supports dense 4-page resumes without clipping
         const pdfH = Math.min(Math.max(bodyH, 800), 5000);
         console.log(`[${SERVER_VERSION}] /generate-pdf bodyH=${bodyH} pdfH=${pdfH}`);
 
@@ -673,9 +673,9 @@ app.post('/generate-pdf', async (req, res) => {
     }
 });
 
-// ═════════════════════════════════════════════════════════════════════════════
+// ----------------------------------------------------------------------------
 // POST /extract-resume
-// ═════════════════════════════════════════════════════════════════════════════
+// ----------------------------------------------------------------------------
 app.post('/extract-resume', async (req, res) => {
 
     try {
@@ -685,19 +685,19 @@ app.post('/extract-resume', async (req, res) => {
 
         const prompt = `You are an expert resume parser. Extract structured data from the resume text below.
 
-IMPORTANT — Two-column PDF note: The text may be extracted from a two-column PDF layout where sidebar content (skills, certifications, summary) is interleaved with main content (experience, education). Intelligently identify and separate these sections regardless of their order in the raw text.
+IMPORTANT - Two-column PDF note: The text may be extracted from a two-column PDF layout where sidebar content (skills, certifications, summary) is interleaved with main content (experience, education). Intelligently identify and separate these sections regardless of their order in the raw text.
 
 Return ONLY valid JSON. No markdown, no code fences, no explanations.
 
 Schema:
 {
   "fullName": "string",
-  "title": "string — job title/headline only, not a sentence",
+  "title": "string - job title/headline only, not a sentence",
   "email": "string",
   "phone": "string",
-  "location": "string — city/country only",
-  "linkedIn": "string — full URL or path",
-  "summary": "string — 2-4 sentence professional summary, rewrite from About section if present",
+  "location": "string - city/country only",
+  "linkedIn": "string - full URL or path",
+  "summary": "string - 2-4 sentence professional summary, rewrite from About section if present",
   "skills": ["array of individual skill strings, max 20"],
   "experiences": [
     {
@@ -705,7 +705,7 @@ Schema:
       "title": "string",
       "startDate": "string e.g. Jan 2021",
       "endDate": "string e.g. Present",
-      "bullets": ["MAXIMUM 4 bullet points per role — pick the 4 most impactful, quantified achievements. Rewrite each to start with a strong action verb. Each bullet max 120 characters."]
+      "bullets": ["MAXIMUM 4 bullet points per role - pick the 4 most impactful, quantified achievements. Rewrite each to start with a strong action verb. Each bullet max 120 characters."]
     }
   ],
   "education": [
@@ -713,17 +713,17 @@ Schema:
       "degree": "string e.g. Bachelor of Technology",
       "field": "string e.g. Computer Science",
       "school": "string",
-      "years": "string e.g. 2014 – 2018"
+      "years": "string e.g. 2014 - 2018"
     }
   ],
   "certifications": ["array of certification name strings only, max 8"]
 }
 
 CRITICAL RULES:
-1. MAX 4 bullets per experience role — choose the most impactful ones with numbers/results
-2. MAX 20 skills — pick the most relevant technical skills
-3. Ignore repeated or similar bullets — deduplicate
-4. Skills, certifications, and summary often appear in a sidebar — extract them correctly even if interleaved with experience text
+1. MAX 4 bullets per experience role - choose the most impactful ones with numbers/results
+2. MAX 20 skills - pick the most relevant technical skills
+3. Ignore repeated or similar bullets - deduplicate
+4. Skills, certifications, and summary often appear in a sidebar - extract them correctly even if interleaved with experience text
 5. Do NOT include generic bullets like "Roles and responsibilities include..." or "Continue to bridge the gap..."
 
 Resume text:
@@ -759,309 +759,77 @@ ${text}`;
     }
 });
 
-// ═════════════════════════════════════════════════════════════════════════════
+// ----------------------------------------------------------------------------
+// AI THEME TOKENS - the bulletproof theming system
+// ----------------------------------------------------------------------------
+// The AI returns ONLY a set of colour + font values (design tokens). The
+// frontend applies them as CSS custom properties (--rn-*) on a 100%-hardcoded
+// layout. The AI never authors CSS, so it can NEVER touch grid/position/size:
+// layout is structurally unbreakable no matter what the user prompts.
+//
+// This server's job is to guarantee the token set is ALWAYS complete, valid,
+// and accessible: every colour is a real hex value, every font is whitelisted,
+// and text/background pairs meet WCAG AA contrast. Anything the model gets
+// wrong is repaired here before it ever reaches the client.
 
-// ─── AI CSS sanitizer ─────────────────────────────────────────────────────────
-// Comprehensively strips any property that can break layout.
-// Three-pass approach: strip dangerous values → fix column constraints → append hard overrides.
-function sanitizeAiCss(css) {
-    if (!css) return '';
+// Fonts the frontend supports (app.css [data-font] selectors). Anything the
+// model returns that is not in this list is coerced to 'Inter'.
+const ALLOWED_FONTS = ['Inter', 'Helvetica', 'Georgia', 'Times New Roman', 'Poppins', 'Roboto', 'system-ui'];
 
-    // ── Pass 1: Strip unconditionally dangerous values (anywhere in the CSS) ──
+// Safe fallback palette (Salesforce-classic look) used for any missing/invalid
+// token, and as the entire response if the AI call fails.
+const DEFAULT_TOKENS = {
+    headerBg:     '#032d60',
+    headerText:   '#ffffff',
+    headerSub:    '#cfe0f3',
+    sidebarBg:    '#f5f7fa',
+    sidebarText:  '#374151',
+    sidebarTitle: '#032d60',
+    accent:       '#0b5cab',
+    mainBg:       '#ffffff',
+    mainText:     '#1f2937',
+    mainTitle:    '#032d60',
+    mainRole:     '#0b5cab',
+    skillBg:      '#e8eef7',
+    skillText:    '#032d60',
+    certBg:       '#00000000',  // transparent by default
+    certText:     '#374151',
+    fontBody:     'Inter',
+    fontHeading:  'Inter'
+};
 
-    // position: absolute / fixed → relative (causes overlap everywhere)
-    css = css.replace(/position\s*:\s*(absolute|fixed)\s*(!important)?\s*;/gi,
-        'position: relative;');
+// Colour token keys (everything except the two font keys)
+const COLOR_TOKEN_KEYS = Object.keys(DEFAULT_TOKENS).filter(k => !k.startsWith('font'));
 
-    // overflow: hidden / clip → visible (clips sidebar content from ANY element)
-    css = css.replace(/overflow(-[xy])?\s*:\s*(hidden|clip)\s*(!important)?\s*;/gi,
-        function(m, axis) { return 'overflow' + (axis||'') + ': visible;'; });
+// Accept only real CSS hex colours: #rgb, #rgba, #rrggbb, #rrggbbaa
+const HEX_PATTERN = /^#([0-9a-fA-F]{3}|[0-9a-fA-F]{4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/;
 
-    // display: none (accidentally hides sections)
-    css = css.replace(/display\s*:\s*none\s*(!important)?\s*;/gi, '');
+function isHex(v) { return typeof v === 'string' && HEX_PATTERN.test(v.trim()); }
 
-    // float: left / right (breaks grid layout entirely)
-    css = css.replace(/float\s*:\s*(left|right)\s*(!important)?\s*;/gi, '');
-
-    // negative margins (causes sections to overlap)
-    css = css.replace(/margin(-top|-bottom|-left|-right)?\s*:\s*-[\d.]+[a-z%]*\s*(!important)?\s*;/gi, '');
-
-    // negative z-index (elements disappear behind others)
-    css = css.replace(/z-index\s*:\s*-[\d]+\s*(!important)?\s*;/gi, 'z-index: 0;');
-
-    // transform: translate with negative values (moves content off-screen)
-    css = css.replace(/transform\s*:[^;]*translate[^;]*-[\d][^;]*;/gi, '');
-
-    // ── Pass 2: Protect structural sizing constraints ──────────────────────
-
-    // Strip ALL grid/flex structural overrides — lock the 2-col layout
-    // grid-template-columns
-    css = css.replace(
-        /(\.rb-resume--ai-generated[^{]*\.rb-resume__body[^{]*\{[^}]*)grid-template-columns\s*:[^;]+;/gi,
-        '$1/* grid-template-columns locked */'
-    );
-    // grid-template-rows (can push content off page)
-    css = css.replace(
-        /(\.rb-resume--ai-generated[^{]*\{[^}]*)grid-template-rows\s*:[^;]+;/gi,
-        '$1/* grid-template-rows removed */'
-    );
-    // grid-area (can reposition elements)
-    css = css.replace(
-        /(\.rb-resume--ai-generated[^{]*\{[^}]*)grid-area\s*:[^;]+;/gi,
-        '$1/* grid-area removed */'
-    );
-    // grid-column / grid-row spans
-    css = css.replace(
-        /(\.rb-resume--ai-generated[^{]*\{[^}]*)grid-(?:column|row)\s*:[^;]+;/gi,
-        '$1/* grid span removed */'
-    );
-    // display: grid or flex on sidebar/main (breaks the column structure)
-    css = css.replace(
-        /(\.rb-resume--ai-generated[^{]*(?:sidebar|main)[^{]*\{[^}]*)display\s*:\s*(?:grid|flex)\s*(!important)?\s*;/gi,
-        '$1display: block;'
-    );
-    // min-width on sidebar (breaks the column width)
-    css = css.replace(
-        /(\.rb-resume--ai-generated[^{]*(?:sidebar)[^{]*\{[^}]*)min-width\s*:[^;]+;/gi,
-        '$1/* min-width removed */'
-    );
-
-    // Strip width overrides on sidebar/main (let grid control sizing)
-    css = css.replace(
-        /(\.rb-resume--ai-generated[^{]*(?:sidebar|main)[^{]*\{[^}]*)\bwidth\s*:\s*[\d.]+[a-z%]+\s*(!important)?\s*;/gi,
-        '$1/* width locked by grid */'
-    );
-
-    // Strip fixed pixel heights on structural containers (content is clipped)
-    css = css.replace(
-        /(\.rb-resume--ai-generated[^{]*(?:sidebar|main|body|section|summary|header)[^{]*\{[^}]*)\bheight\s*:\s*[\d.]+[a-z%]+\s*(!important)?\s*;/gi,
-        '$1min-height: 0;'
-    );
-
-    // Cap extreme padding (max 32px per side prevents blowout)
-    css = css.replace(
-        /\bpadding(-top|-bottom|-left|-right)?\s*:\s*([\d]+)px\s*(!important)?\s*;/gi,
-        function(m, side, val, imp) {
-            return parseInt(val, 10) > 32
-                ? 'padding' + (side||'') + ': 32px;'
-                : m;
-        }
-    );
-
-    // Cap extreme font sizes to prevent blowout (max 24px body, 32px heading)
-    css = css.replace(
-        /\bfont-size\s*:\s*([\d]+)px\s*(!important)?\s*;/gi,
-        function(m, val, imp) {
-            return parseInt(val, 10) > 32 ? 'font-size: 14px;' : m;
-        }
-    );
-
-    // ── Pass 1.5: Strip order/flex-order that swaps columns ─────────────────
-    css = css.replace(/\border\s*:\s*-?\d+\s*(!important)?\s*;/gi, '');
-    css = css.replace(/flex-order\s*:\s*-?\d+\s*(!important)?\s*;/gi, '');
-
-    // ── Pass 1.6: Strip visibility/opacity zero on structural elements ────────
-    css = css.replace(
-        /(\.rb-resume--ai-generated[^{]*\{[^}]*)visibility\s*:\s*hidden\s*(!important)?\s*;/gi,
-        '$1visibility: visible;'
-    );
-    css = css.replace(
-        /(\.rb-resume--ai-generated[^{]*\{[^}]*)opacity\s*:\s*0\s*(!important)?\s*;/gi,
-        '$1opacity: 1;'
-    );
-
-    // ── Pass 3: Append LOCKED structural overrides — AI cannot override these ──
-    // Using extreme specificity to beat anything the AI generates.
-    // These define the structural skeleton. AI only changes colors/fonts/borders.
-    css += `
-
-/* ══════════════════════════════════════════════════════════════════
-   RENONYM STRUCTURAL LOCK — AI cannot override these properties.
-   Covers every way the AI could break the two-column resume layout.
-   ══════════════════════════════════════════════════════════════════ */
-
-/* Root container */
-.rb-resume--ai-generated {
-    overflow: visible !important;
-    box-sizing: border-box !important;
-    position: relative !important;
-    float: none !important;
-    display: block !important;
+// Reduce any hex (incl. alpha / shorthand) to an opaque 6-digit hex for the
+// luminance helpers, which expect 3- or 6-digit input.
+function toOpaqueHex6(hex) {
+    let h = String(hex || '').replace(/^#/, '');
+    if (h.length === 4) h = h.slice(0, 3);        // #rgba -> #rgb
+    else if (h.length === 8) h = h.slice(0, 6);   // #rrggbbaa -> #rrggbb
+    return '#' + h;
 }
 
-/* Two-column body — locked forever */
-.rb-resume--ai-generated .rb-resume__body {
-    display: grid !important;
-    grid-template-columns: 210px 1fr !important;
-    grid-template-rows: auto !important;
-    grid-auto-rows: auto !important;
-    grid-template-areas: none !important;
-    overflow: visible !important;
-    position: relative !important;
-    width: 100% !important;
-    height: auto !important;
-    min-height: 0 !important;
-    flex-direction: unset !important;
-    flex-wrap: unset !important;
+// Returns true when a hex value is fully transparent (alpha 00)
+function isTransparent(hex) {
+    const h = String(hex || '').replace(/^#/, '');
+    if (h.length === 8) return h.slice(6).toLowerCase() === '00';
+    if (h.length === 4) return h.slice(3).toLowerCase() === '0';
+    return false;
 }
 
-/* Sidebar — LEFT column, always */
-.rb-resume--ai-generated .rb-resume__sidebar {
-    grid-column: 1 / 2 !important;
-    grid-row: 1 !important;
-    order: 0 !important;
-    display: flex !important;
-    flex-direction: column !important;
-    position: relative !important;
-    float: none !important;
-    overflow: visible !important;
-    height: auto !important;
-    min-height: 0 !important;
-    width: auto !important;
-    max-width: none !important;
-    min-width: 0 !important;
-    align-self: stretch !important;
-    visibility: visible !important;
-    opacity: 1 !important;
-    box-sizing: border-box !important;
+function clampFont(v) {
+    if (typeof v !== 'string') return 'Inter';
+    const match = ALLOWED_FONTS.find(f => f.toLowerCase() === v.trim().toLowerCase());
+    return match || 'Inter';
 }
 
-/* Main — RIGHT column, always */
-.rb-resume--ai-generated .rb-resume__main {
-    grid-column: 2 / 3 !important;
-    grid-row: 1 !important;
-    order: 1 !important;
-    display: flex !important;
-    flex-direction: column !important;
-    position: relative !important;
-    float: none !important;
-    overflow: visible !important;
-    height: auto !important;
-    min-height: 0 !important;
-    width: auto !important;
-    max-width: none !important;
-    min-width: 0 !important;
-    align-self: stretch !important;
-    visibility: visible !important;
-    opacity: 1 !important;
-    box-sizing: border-box !important;
-}
-
-/* Sections — stacked, visible, auto height */
-.rb-resume--ai-generated .rb-resume__section {
-    position: relative !important;
-    float: none !important;
-    display: block !important;
-    overflow: visible !important;
-    height: auto !important;
-    min-height: 0 !important;
-    flex-shrink: 0 !important;
-    box-sizing: border-box !important;
-    width: auto !important;
-    order: unset !important;
-    visibility: visible !important;
-    opacity: 1 !important;
-}
-
-/* Section titles */
-.rb-resume--ai-generated .rb-section-title {
-    display: block !important;
-    position: relative !important;
-    overflow: visible !important;
-    height: auto !important;
-    width: auto !important;
-    visibility: visible !important;
-    opacity: 1 !important;
-}
-
-/* Summary */
-.rb-resume--ai-generated .rb-summary {
-    position: relative !important;
-    overflow: visible !important;
-    height: auto !important;
-    word-break: break-word !important;
-    white-space: normal !important;
-    display: block !important;
-    visibility: visible !important;
-}
-
-/* Skills row */
-.rb-resume--ai-generated .rb-skills {
-    display: flex !important;
-    flex-wrap: wrap !important;
-    height: auto !important;
-    overflow: visible !important;
-    position: relative !important;
-}
-
-/* Skill pills */
-.rb-resume--ai-generated .rb-skill-pill {
-    display: inline-flex !important;
-    position: relative !important;
-    height: auto !important;
-    overflow: visible !important;
-    white-space: nowrap !important;
-    box-sizing: border-box !important;
-    order: unset !important;
-    visibility: visible !important;
-    opacity: 1 !important;
-}
-
-/* Experience and education items */
-.rb-resume--ai-generated .rb-exp-item,
-.rb-resume--ai-generated .rb-edu-item,
-.rb-resume--ai-generated .rb-cert {
-    position: relative !important;
-    overflow: visible !important;
-    height: auto !important;
-    display: block !important;
-    float: none !important;
-    box-sizing: border-box !important;
-    order: unset !important;
-    visibility: visible !important;
-    opacity: 1 !important;
-}
-
-/* Bullet lists */
-.rb-resume--ai-generated .rb-exp-bullets {
-    overflow: visible !important;
-    height: auto !important;
-    position: relative !important;
-    display: block !important;
-    list-style: disc !important;
-}
-.rb-resume--ai-generated .rb-exp-bullets li {
-    overflow: visible !important;
-    height: auto !important;
-    position: relative !important;
-    display: list-item !important;
-    visibility: visible !important;
-    opacity: 1 !important;
-}
-
-/* Contact row */
-.rb-resume--ai-generated .rb-resume__contact {
-    overflow: visible !important;
-    flex-wrap: wrap !important;
-    height: auto !important;
-}
-
-/* Header */
-.rb-resume--ai-generated .rb-resume__header {
-    overflow: visible !important;
-    position: relative !important;
-    height: auto !important;
-    display: flex !important;
-    order: unset !important;
-}
-`;
-
-    return css;
-}
-
-
-
-// ── WCAG Contrast Helpers ─────────────────────────────────────────────────────
+// --- WCAG contrast helpers (reused for token validation) --------------------
 function hexToRgb(hex) {
     hex = hex.replace(/^#/, '');
     if (hex.length === 3) hex = hex.split('').map(c => c + c).join('');
@@ -1077,8 +845,8 @@ function relativeLuminance({ r, g, b }) {
 }
 function contrastRatio(hex1, hex2) {
     try {
-        const l1 = relativeLuminance(hexToRgb(hex1));
-        const l2 = relativeLuminance(hexToRgb(hex2));
+        const l1 = relativeLuminance(hexToRgb(toOpaqueHex6(hex1)));
+        const l2 = relativeLuminance(hexToRgb(toOpaqueHex6(hex2)));
         const [hi, lo] = [Math.max(l1, l2), Math.min(l1, l2)];
         return (hi + 0.05) / (lo + 0.05);
     } catch (e) { return 4.5; }
@@ -1090,49 +858,61 @@ function ensureReadableText(bgHex) {
     if (rb >= 4.5) return '#000000';
     return rw > rb ? '#FFFFFF' : '#111111';
 }
-function validateAndFixContrast(css) {
-    const fixes = [];
-    const sidebarBgM = css.match(/\.rb-resume--ai-generated\s+\.rb-resume__sidebar\s*\{[^}]*background(?:-color)?\s*:\s*(#[0-9A-Fa-f]{3,8})/);
-    if (sidebarBgM) {
-        const bg = sidebarBgM[1];
-        const textM = css.match(/\.rb-resume--ai-generated\s+\.rb-resume__sidebar\s*\{[^}]*\bcolor\s*:\s*(#[0-9A-Fa-f]{3,8})/);
-        if (!textM || contrastRatio(bg, textM[1]) < 4.5) {
-            const fixed = ensureReadableText(bg);
-            css += '\n/* contrast-fix: sidebar */\n'
-                + '.rb-resume--ai-generated .rb-resume__sidebar { color: ' + fixed + '; }\n'
-                + '.rb-resume--ai-generated .rb-resume__sidebar .rb-section-title { color: ' + fixed + '; opacity: 0.7; }\n'
-                + '.rb-resume--ai-generated .rb-resume__sidebar .rb-summary { color: ' + fixed + '; opacity: 0.85; }\n'
-                + '.rb-resume--ai-generated .rb-resume__sidebar .rb-cert { color: ' + fixed + '; opacity: 0.85; }';
-            fixes.push('sidebar text → ' + fixed);
+
+// Take whatever the model produced and return a guaranteed-valid token set:
+//  1. every colour is a real hex (else falls back to DEFAULT_TOKENS)
+//  2. fonts are whitelisted
+//  3. text/background pairs are forced to >= 4.5:1 WCAG AA contrast
+function sanitizeTokens(raw) {
+    const t = {};
+    const src = (raw && typeof raw === 'object') ? raw : {};
+
+    // 1. Colours: keep valid hex, else fall back to the safe default
+    COLOR_TOKEN_KEYS.forEach(key => {
+        t[key] = isHex(src[key]) ? src[key].trim() : DEFAULT_TOKENS[key];
+    });
+
+    // 2. Fonts: whitelist only
+    t.fontBody    = clampFont(src.fontBody);
+    t.fontHeading = clampFont(src.fontHeading);
+
+    // 3. Contrast: fix the TEXT colour wherever it can't be read on its bg.
+    // Cert background is often transparent, so test cert text against the
+    // sidebar background it actually sits on.
+    const pairs = [
+        ['headerText',   'headerBg'],
+        ['headerSub',    'headerBg'],
+        ['sidebarText',  'sidebarBg'],
+        ['sidebarTitle', 'sidebarBg'],
+        ['mainText',     'mainBg'],
+        ['mainTitle',    'mainBg'],
+        ['skillText',    'skillBg'],
+        ['certText',     isTransparent(t.certBg) ? 'sidebarBg' : 'certBg']
+    ];
+    const fixed = [];
+    pairs.forEach(([textKey, bgKey]) => {
+        const bg = t[bgKey];
+        if (contrastRatio(bg, t[textKey]) < 4.5) {
+            t[textKey] = ensureReadableText(bg);
+            fixed.push(textKey);
         }
-    }
-    const headerBgM = css.match(/\.rb-resume--ai-generated\s+\.rb-resume__header\s*\{[^}]*background(?:-color)?\s*:\s*(#[0-9A-Fa-f]{3,8})/);
-    if (headerBgM) {
-        const bg = headerBgM[1];
-        const nameM = css.match(/\.rb-resume--ai-generated\s+\.rb-resume__name\s*\{[^}]*\bcolor\s*:\s*(#[0-9A-Fa-f]{3,8})/);
-        if (!nameM || contrastRatio(bg, nameM[1]) < 4.5) {
-            const fixed = ensureReadableText(bg);
-            css += '\n/* contrast-fix: header */\n'
-                + '.rb-resume--ai-generated .rb-resume__name { color: ' + fixed + ' !important; }\n'
-                + '.rb-resume--ai-generated .rb-resume__title-line { color: ' + fixed + '; opacity: 0.82; }\n'
-                + '.rb-resume--ai-generated .rb-resume__contact-item { color: ' + fixed + '; opacity: 0.72; }';
-            fixes.push('header text → ' + fixed);
-        }
-    }
-    if (fixes.length) console.log('[contrast-fix]', fixes.join(', '));
-    return css;
+    });
+    if (fixed.length) console.log('[token-contrast] fixed:', fixed.join(', '));
+
+    return t;
 }
 
-
+// ----------------------------------------------------------------------------
 // POST /generate-template
-// Generates AI CSS — now supports optional inspiration image via base64
-// ═════════════════════════════════════════════════════════════════════════════
+// ----------------------------------------------------------------------------
+// Returns { tokens, layout }. The AI picks colours/fonts (tokens) and a layout
+// from a fixed set; the frontend renders a hardcoded structure styled by those
+// tokens. No CSS is ever generated or trusted.
 app.post('/generate-template', async (req, res) => {
 
     try {
         const {
             prompt,
-            resumeData,
             metadata,
             inspirationBase64,
             inspirationMimeType
@@ -1145,54 +925,11 @@ app.post('/generate-template', async (req, res) => {
             inspirationBase64.length < 4 * 1024 * 1024  // 4MB base64 limit
         );
 
-        // ── Step 0: AI color extraction — get exact hex palette from text prompt ──
-        // GPT reads the intent and returns precise hex codes before CSS generation.
-        // Handles brands, teams, aesthetics, moods — anything the user describes.
-        let colorPaletteBlock = '';
-        try {
-            const colorResp = await openai.chat.completions.create({
-                model: 'gpt-4.1-mini',
-                messages: [{
-                    role: 'system',
-                    content: 'You are a world-class color designer. Given a design brief, return ONLY a JSON object (no markdown) with exact hex color values. Keys: primary, secondary, accent, sidebarBg, sidebarText, headerBg, headerText, mainBg, reasoning.'
-                }, {
-                    role: 'user',
-                    content: 'Design brief: "' + sanitizeInput(prompt) + '"\n\nReturn the precise hex color palette as JSON only.'
-                }],
-                temperature: 0.2,
-                max_tokens: 250
-            });
-            let raw = colorResp.choices[0].message.content.trim();
-            raw = raw.replace(/^```json|^```|```$/gm, '').trim();
-            const palette = JSON.parse(raw);
-            console.log('[color-extraction] ' + (palette.reasoning || 'ok'));
-            colorPaletteBlock = [
-                'EXTRACTED COLOR PALETTE — use these EXACT hex values as your foundation:',
-                '  Header background:   ' + palette.headerBg,
-                '  Header text:         ' + palette.headerText,
-                '  Sidebar background:  ' + palette.sidebarBg,
-                '  Sidebar text:        ' + palette.sidebarText,
-                '  Primary accent:      ' + palette.primary,
-                '  Secondary accent:    ' + palette.secondary,
-                '  Highlight accent:    ' + palette.accent,
-                '  Main body bg:        ' + palette.mainBg,
-                '',
-                'START your CSS with these mandatory rules then build creatively on top:',
-                '.rb-resume--ai-generated .rb-resume__header { background: ' + palette.headerBg + '; }',
-                '.rb-resume--ai-generated .rb-resume__name { color: ' + palette.headerText + '; }',
-                '.rb-resume--ai-generated .rb-resume__sidebar { background: ' + palette.sidebarBg + '; }',
-            ].join('\n');
-        } catch (colorErr) {
-            console.warn('[color-extraction] failed (non-fatal):', colorErr.message);
-        }
-
-        // ── Step 1: If inspiration image provided, vision-analyse it first ──
+        // -- Step 1: If inspiration image provided, vision-analyse it first --
         let inspirationStyleSignals = '';
-
         if (hasInspiration) {
             try {
                 console.log(`[${SERVER_VERSION}] Analysing inspiration image (${inspirationMimeType})`);
-
                 const visionCompletion = await openai.chat.completions.create({
                     model: 'gpt-4o',
                     messages: [
@@ -1201,8 +938,8 @@ app.post('/generate-template', async (req, res) => {
                             content: `You are a design analyst specialising in resume aesthetics and typography.
 Analyse the uploaded resume image and extract ONLY style/design signals.
 DO NOT extract or mention any personal data, names, companies, or content.
-Focus exclusively on: layout structure, colour palette, typography choices, spacing density, section divider styles, header treatment, sidebar vs single-column, font character (serif/sans), visual hierarchy signals.
-Return your analysis as a compact, structured paragraph of CSS-relevant design signals only.`
+Focus exclusively on: colour palette (give hex values where you can), typography character (serif/sans), spacing density, header treatment, sidebar vs single-column, visual hierarchy.
+Return a compact, structured paragraph of design signals only.`
                         },
                         {
                             role: 'user',
@@ -1211,12 +948,12 @@ Return your analysis as a compact, structured paragraph of CSS-relevant design s
                                     type: 'image_url',
                                     image_url: {
                                         url:    `data:${inspirationMimeType};base64,${inspirationBase64}`,
-                                        detail: 'low'   // Low detail sufficient for style extraction
+                                        detail: 'low'
                                     }
                                 },
                                 {
                                     type: 'text',
-                                    text: 'Analyse this resume image for design and style signals only. Extract: colour palette, typography style (serif/sans/mono), layout structure (columns, spacing), header style, section dividers, overall visual density. Return only design signals, no personal data.'
+                                    text: 'Analyse this resume image for design and style signals only. Extract colour palette (hex if possible), typography style, layout structure, header style, visual density. Return only design signals, no personal data.'
                                 }
                             ]
                         }
@@ -1224,18 +961,15 @@ Return your analysis as a compact, structured paragraph of CSS-relevant design s
                     max_tokens: 300,
                     temperature: 0.3
                 });
-
                 inspirationStyleSignals = visionCompletion.choices[0].message.content.trim();
-                console.log(`[${SERVER_VERSION}] Inspiration signals extracted:`, inspirationStyleSignals.slice(0, 100));
-
+                console.log(`[${SERVER_VERSION}] Inspiration signals:`, inspirationStyleSignals.slice(0, 100));
             } catch (visionErr) {
-                // Non-fatal — proceed without inspiration signals
                 console.warn(`[${SERVER_VERSION}] Vision analysis failed (non-fatal):`, visionErr.message);
             }
         }
 
-        // ── Step 1.5: Classify layout from vision signals ──────────────────────
-        let detectedLayout = 'two-col'; // default
+        // -- Step 2: Classify layout (one of the four hardcoded layouts) -----
+        let detectedLayout = 'two-col';
         if (inspirationStyleSignals || prompt) {
             try {
                 const layoutCompletion = await openai.chat.completions.create({
@@ -1264,151 +998,92 @@ Reply with ONLY ONE word: two-col, single, top-banner, or asymmetric`
                     detectedLayout = raw;
                 }
             } catch (e) {
-                // non-fatal — use default
+                // non-fatal - use default
             }
         }
 
-        // ── Step 2: Generate CSS template ──
-        const systemPrompt = `You are an elite AI resume designer. You ONLY generate CSS.
+        // -- Step 3: Generate design TOKENS (colours + fonts only) -----------
+        const tokenSystemPrompt = `You are an elite resume colour & typography designer.
+You DO NOT write CSS. You return ONLY a JSON object of design tokens.
 
-You design modern, premium, ATS-friendly resumes.
+Return EXACTLY these keys, every value a CSS hex colour (e.g. "#1a2b3c") except
+fontBody and fontHeading which must be one of:
+Inter, Helvetica, Georgia, Times New Roman, Poppins, Roboto, system-ui.
+
+{
+  "headerBg":     "hex - header/banner background",
+  "headerText":   "hex - main name text on the header",
+  "headerSub":    "hex - title line + contact text on the header",
+  "sidebarBg":    "hex - sidebar background",
+  "sidebarText":  "hex - sidebar body text",
+  "sidebarTitle": "hex - sidebar section titles",
+  "accent":       "hex - primary accent (rules, role titles, highlights)",
+  "mainBg":       "hex - main content background (usually white or near-white)",
+  "mainText":     "hex - main content body text",
+  "mainTitle":    "hex - main section titles",
+  "mainRole":     "hex - job role / position titles",
+  "skillBg":      "hex - skill pill background",
+  "skillText":    "hex - skill pill text",
+  "certBg":       "hex - certification chip background (use #00000000 for transparent)",
+  "certText":     "hex - certification text",
+  "fontBody":     "one allowed font name",
+  "fontHeading":  "one allowed font name"
+}
 
 RULES:
-- Output ONLY raw CSS. No markdown, no code fences, no explanations.
-- ONLY use class .rb-resume--ai-generated and its descendants.
-- All selectors MUST start with .rb-resume--ai-generated
+- Output ONLY the JSON object. No markdown, no commentary.
+- Ensure strong, readable contrast between every text colour and its background (aim for WCAG AA, 4.5:1+).
+- Match the requested mood/brand/aesthetic precisely with real hex values.
+- Keep it professional and ATS-friendly (clean, not garish).`;
 
-HARD CONSTRAINTS — violating ANY of these will break the resume:
-- FORBIDDEN: position: absolute or position: fixed (on ANY element)
-- FORBIDDEN: overflow: hidden or overflow: clip (on ANY element)
-- FORBIDDEN: display: none (on any element)
-- FORBIDDEN: float: left or float: right (on any element)
-- FORBIDDEN: negative margin values (any side)
-- FORBIDDEN: negative z-index values
-- FORBIDDEN: changing grid-template-columns on .rb-resume__body
-- FORBIDDEN: setting width on .rb-resume__sidebar or .rb-resume__main
-- FORBIDDEN: setting fixed pixel height on sidebar, main, body, or section
-- FORBIDDEN: padding values above 32px on any side
-- FORBIDDEN: font-size above 32px anywhere in the resume body
-
-ALLOWED — style ONLY these visual/cosmetic properties:
-- Colors: color, background-color, background (gradients OK)
-- Typography: font-family, font-size (8–24px), font-weight, letter-spacing, line-height, text-transform
-- Borders: border, border-radius, border-color, border-width, border-style
-- Spacing: padding (max 32px), margin (positive values only), gap
-- Decorative: box-shadow, opacity (never 0), text-decoration
-
-- Preserve readable font sizes (minimum 8px body, 10px headings).
-- Ensure high colour contrast for ATS scanning.
-- Keep the two-column sidebar + main layout intact.
-- Optimise for A4 single-page output.
-- Use web-safe fonts only: system-ui, Georgia, 'Times New Roman', 'Courier New'.
-
-CSS selectors available to style:
-.rb-resume--ai-generated
-.rb-resume--ai-generated .rb-resume__top-deco
-.rb-resume--ai-generated .rb-resume__header
-.rb-resume--ai-generated .rb-resume__photo-img
-.rb-resume--ai-generated .rb-resume__photo-placeholder
-.rb-resume--ai-generated .rb-resume__name
-.rb-resume--ai-generated .rb-resume__title-line
-.rb-resume--ai-generated .rb-resume__contact
-.rb-resume--ai-generated .rb-resume__contact-item
-.rb-resume--ai-generated .rb-resume__body
-.rb-resume--ai-generated .rb-resume__sidebar
-.rb-resume--ai-generated .rb-resume__main
-.rb-resume--ai-generated .rb-resume__section
-.rb-resume--ai-generated .rb-section-title
-.rb-resume--ai-generated .rb-summary
-.rb-resume--ai-generated .rb-skills
-.rb-resume--ai-generated .rb-skill-pill
-.rb-resume--ai-generated .rb-cert
-.rb-resume--ai-generated .rb-exp-item
-.rb-resume--ai-generated .rb-exp-head
-.rb-resume--ai-generated .rb-exp-company
-.rb-resume--ai-generated .rb-exp-date
-.rb-resume--ai-generated .rb-exp-role
-.rb-resume--ai-generated .rb-exp-bullets
-.rb-resume--ai-generated .rb-exp-bullets li
-.rb-resume--ai-generated .rb-edu-item
-.rb-resume--ai-generated .rb-edu-head
-.rb-resume--ai-generated .rb-edu-degree
-.rb-resume--ai-generated .rb-edu-years
-.rb-resume--ai-generated .rb-edu-school`;
-
-        const densityWarning = (metadata?.totalBullets > 12 || metadata?.experienceCount > 3)
-            ? `\nDENSITY WARNING: This resume has ${metadata?.totalBullets || 'many'} bullet points across ${metadata?.experienceCount || 'multiple'} roles.
-You MUST use compact CSS to fit it on one page:
-- .rb-resume--ai-generated font-size: 8.5px
-- .rb-resume--ai-generated .rb-resume__body padding: 0
-- .rb-resume--ai-generated .rb-resume__section margin-bottom: 10px
-- .rb-resume--ai-generated .rb-exp-item margin-bottom: 8px
-- .rb-resume--ai-generated .rb-exp-bullets li padding/margin: 1px
-- .rb-resume--ai-generated .rb-resume__header padding: 16px 24px 12px`
+        const densityNote = (metadata?.totalBullets > 12 || metadata?.experienceCount > 3)
+            ? 'This is a dense resume - prefer a calm, high-contrast palette that stays readable at small sizes.'
             : '';
 
-        const inspirationBlock = inspirationStyleSignals
-            ? `\nSTYLE INSPIRATION SIGNALS (extracted from uploaded reference — translate these into equivalent CSS):
-${inspirationStyleSignals}`
+        const inspirationNote = inspirationStyleSignals
+            ? `\nSTYLE SIGNALS from an uploaded reference (translate the palette/typography into tokens):\n${inspirationStyleSignals}`
             : '';
 
-        const userPrompt = `USER DESIGN REQUEST:
-${sanitizeInput(prompt)}
-${colorPaletteBlock}
-${inspirationBlock}
+        const tokenUserPrompt = `DESIGN REQUEST:
+${sanitizeInput(prompt) || 'A clean, modern, professional resume.'}
+${inspirationNote}
+${densityNote}
 
-RESUME CONTENT METADATA:
-- Has photo: ${metadata?.hasPhoto || false}
-- Experience entries: ${metadata?.experienceCount || 0}
-- Skills: ${metadata?.skillCount || 0}
-- Certifications: ${metadata?.certificationCount || 0}
-- Education entries: ${metadata?.educationCount || 0}
-- Summary length: ${metadata?.summaryLength || 0} characters
-- Total bullet points across all roles: ${metadata?.totalBullets || 0}
-- Content density: ${metadata?.totalBullets > 12 || metadata?.experienceCount > 3 ? 'HIGH — use compact spacing' : 'NORMAL'}
-${densityWarning}
+Return the design tokens as JSON only.`;
 
-Generate CSS that:
-1. Matches the design intent from the user request
-${inspirationStyleSignals ? '2. Incorporates the style signals from the inspiration image — translate their visual language into equivalent CSS for the rb-resume structure' : '2. Creates a distinctive, premium design'}
-3. Is specifically optimised for the content density above
-4. Keeps everything on ONE A4 page — this is critical
-5. Uses ONLY the .rb-resume--ai-generated namespace
-6. Returns ONLY raw CSS — nothing else`;
+        let tokens;
+        try {
+            const completion = await openai.chat.completions.create({
+                model:           'gpt-4.1-mini',
+                messages:        [
+                    { role: 'system', content: tokenSystemPrompt },
+                    { role: 'user',   content: tokenUserPrompt   }
+                ],
+                temperature:     0.5,
+                max_tokens:      500,
+                response_format: { type: 'json_object' }
+            });
+            const rawTokens = JSON.parse(completion.choices[0].message.content);
+            tokens = sanitizeTokens(rawTokens);
+        } catch (aiErr) {
+            // Graceful degradation - never fail the theming path on an AI hiccup
+            console.warn(`[${SERVER_VERSION}] Token generation failed (using defaults):`, aiErr.message);
+            tokens = { ...DEFAULT_TOKENS };
+        }
 
-        const completion = await openai.chat.completions.create({
-            model:       'gpt-4.1',         // better color accuracy
-            messages:    [
-                { role: 'system', content: systemPrompt },
-                { role: 'user',   content: userPrompt   }
-            ],
-            temperature: 0.65,
-            max_tokens:  3500
-        });
-
-        let css = completion.choices[0].message.content;
-
-        // Strip any accidental markdown fences
-        css = css
-            .replace(/^```(?:css)?\s*/i, '')
-            .replace(/\s*```\s*$/,       '')
-            .trim();
-
-        // Sanitize AI CSS — strips dangerous layout properties that cause overlap
-        css = sanitizeAiCss(css);
-
-        css = validateAndFixContrast(css);
-        res.json({ css, layout: detectedLayout || 'two-col' });
+        console.log(`[${SERVER_VERSION}] /generate-template -> layout=${detectedLayout} accent=${tokens.accent}`);
+        res.json({ tokens, layout: detectedLayout });
 
     } catch (e) {
         console.error('Template generation error:', e);
-        res.status(500).json({ error: 'Template generation failed' });
+        // Even on an unexpected error, hand back a usable theme rather than 500
+        res.json({ tokens: { ...DEFAULT_TOKENS }, layout: 'two-col' });
     }
 });
 
-// ═════════════════════════════════════════════════════════════════════════════
+// ----------------------------------------------------------------------------
 // POST /improve-summary
-// ═════════════════════════════════════════════════════════════════════════════
+// ----------------------------------------------------------------------------
 app.post('/improve-summary', async (req, res) => {
 
     try {
@@ -1434,18 +1109,18 @@ Top skills: ${topSkills || '(not provided)'}
 Recent experience: ${expContext || '(not provided)'}
 
 REQUIREMENTS:
-- 3–4 sentences maximum
+- 3-4 sentences maximum
 - First sentence: years of experience + core expertise + industry context
-- Second sentence: 1–2 quantified or notable achievements
+- Second sentence: 1-2 quantified or notable achievements
 - Third sentence: technical strengths or specialisation
 - Fourth sentence (optional): value proposition or career goal
-- Tone: confident, professional, concise — NOT clichéd
+- Tone: confident, professional, concise - NOT cliched
 - NO phrases like "results-driven", "passionate", "dynamic", "team player", "go-getter"
 - ATS-friendly: include relevant keywords naturally
 - Return ONLY the summary text, no labels, no quotes, no explanation`;
 
         const completion = await openai.chat.completions.create({
-            model:       'gpt-4.1',         // better color accuracy
+            model:       'gpt-4.1',
             messages:    [
                 { role: 'system', content: 'You are a professional resume writer. Return only the requested text.' },
                 { role: 'user',   content: prompt }
@@ -1463,9 +1138,9 @@ REQUIREMENTS:
     }
 });
 
-// ═════════════════════════════════════════════════════════════════════════════
+// ----------------------------------------------------------------------------
 // POST /review-resume
-// ═════════════════════════════════════════════════════════════════════════════
+// ----------------------------------------------------------------------------
 app.post('/review-resume', async (req, res) => {
 
     try {
@@ -1501,13 +1176,13 @@ PROVIDE:
 1. Overall score out of 10
 2. Top 3 strengths (be specific)
 3. Top 3 improvements needed (be specific and actionable)
-4. ATS optimization tips (2–3 points)
+4. ATS optimization tips (2-3 points)
 5. One key recommendation to immediately increase interview chances
 
-Keep response under 250 words. Be direct and specific — no generic advice.`;
+Keep response under 250 words. Be direct and specific - no generic advice.`;
 
         const completion = await openai.chat.completions.create({
-            model:       'gpt-4.1',         // better color accuracy
+            model:       'gpt-4.1',
             messages:    [
                 { role: 'system', content: 'You are a professional resume coach. Provide specific, actionable feedback.' },
                 { role: 'user',   content: prompt }
@@ -1525,12 +1200,12 @@ Keep response under 250 words. Be direct and specific — no generic advice.`;
     }
 });
 
-// ═════════════════════════════════════════════════════════════════════════════
+// ----------------------------------------------------------------------------
 // Start
-// ═════════════════════════════════════════════════════════════════════════════
+// ----------------------------------------------------------------------------
 const PORT = process.env.PORT || 3000;
 
-// ─── Helper: turn resumeData or resumeText into a readable string ─────────────
+// --- Helper: turn resumeData or resumeText into a readable string -----------
 function buildResumeString(resumeData, resumeText) {
     // If we have structured data, use it (gives GPT cleaner, more structured input)
     // Append raw text only if structured data seems sparse (no experiences)
@@ -1539,21 +1214,17 @@ function buildResumeString(resumeData, resumeText) {
     );
 
     if (hasStructured) {
-        // Serialize the structured resumeData
         const structured = serializeResumeData(resumeData);
-        // If we also have raw text and experiences are missing, append it for extra context
         if (resumeText && !resumeData.experiences?.length) {
             return (structured + '\n\n--- ADDITIONAL CONTEXT FROM UPLOADED FILE ---\n' + resumeText).slice(0, 8000);
         }
         return structured.slice(0, 8000);
     }
 
-    // No structured data — use raw text directly (uploaded-only flow)
     if (resumeText && resumeText.trim().length > 50) {
         return resumeText.trim().slice(0, 8000);
     }
 
-    // Otherwise serialize the structured formData from the builder
     if (!resumeData) return 'No resume data provided.';
     return serializeResumeData(resumeData);
 }
@@ -1573,24 +1244,24 @@ function serializeResumeData(resumeData) {
     if (resumeData.experiences?.length) {
         lines.push('\nExperience:');
         resumeData.experiences.forEach(exp => {
-            const dates = exp.dateRange || [exp.startDate, exp.endDate].filter(Boolean).join(' – ');
+            const dates = exp.dateRange || [exp.startDate, exp.endDate].filter(Boolean).join(' - ');
             lines.push(`  ${exp.title || ''} at ${exp.company || ''} (${dates})`);
-            (exp.bullets || []).forEach(b => lines.push(`    • ${b}`));
+            (exp.bullets || []).forEach(b => lines.push(`    - ${b}`));
         });
     }
     if (resumeData.education?.length) {
         lines.push('\nEducation:');
         resumeData.education.forEach(edu => {
-            lines.push(`  ${edu.degree || ''}${edu.field ? ', ' + edu.field : ''} — ${edu.school || ''} (${edu.years || ''})`);
+            lines.push(`  ${edu.degree || ''}${edu.field ? ', ' + edu.field : ''} - ${edu.school || ''} (${edu.years || ''})`);
         });
     }
     return lines.join('\n').slice(0, 8000);
 }
 
-// ─── POST /analyze-job-match ──────────────────────────────────────────────────
+// --- POST /analyze-job-match ------------------------------------------------
 // Accepts either { resumeData, jobDescription } or { resumeText, jobDescription }
 // Returns structured gap analysis: scores + specific actionable suggestions
-// ─────────────────────────────────────────────────────────────────────────────
+// ----------------------------------------------------------------------------
 app.post('/analyze-job-match', async (req, res) => {
     try {
         const { resumeData, resumeText, jobDescription } = req.body;
@@ -1613,7 +1284,7 @@ app.post('/analyze-job-match', async (req, res) => {
 
         const systemPrompt = `You are a senior technical recruiter and ATS specialist with 15 years of experience.
 You analyse resumes against job descriptions and give precise, actionable feedback.
-Your feedback must be SPECIFIC to this exact resume and JD — never generic.
+Your feedback must be SPECIFIC to this exact resume and JD - never generic.
 You return ONLY valid JSON, no markdown, no explanation outside the JSON.`;
 
         const userPrompt = `Analyse this resume against the job description. Be precise and specific.
@@ -1625,41 +1296,41 @@ ${resumeString}
 ${jobDescription.trim().slice(0, 5000)}
 
 === SCORING RULES ===
-- atsScore (0–100): How well the resume is structured for ATS parsing. Consider: section headings present, contact info visible, no tables/columns that break parsing, bullet points used, quantified achievements, appropriate length.
-- jdMatch (0–100): How well the candidate's actual experience and skills match what the JD requires. Be realistic — a mismatch in seniority or core skills should give a low score.
-- keywordCoverage (0–100): Percentage of important technical/domain keywords from the JD that appear anywhere in the resume.
-- skillsCoverage (0–100): Percentage of explicitly listed required skills in the JD that appear in the resume skills section.
+- atsScore (0-100): How well the resume is structured for ATS parsing. Consider: section headings present, contact info visible, no tables/columns that break parsing, bullet points used, quantified achievements, appropriate length.
+- jdMatch (0-100): How well the candidate's actual experience and skills match what the JD requires. Be realistic - a mismatch in seniority or core skills should give a low score.
+- keywordCoverage (0-100): Percentage of important technical/domain keywords from the JD that appear anywhere in the resume.
+- skillsCoverage (0-100): Percentage of explicitly listed required skills in the JD that appear in the resume skills section.
 
 === OUTPUT FORMAT ===
 Return ONLY this JSON (no markdown fences):
 {
-  "atsScore": <integer 0–100>,
-  "jdMatch": <integer 0–100>,
-  "keywordCoverage": <integer 0–100>,
-  "skillsCoverage": <integer 0–100>,
+  "atsScore": <integer 0-100>,
+  "jdMatch": <integer 0-100>,
+  "keywordCoverage": <integer 0-100>,
+  "skillsCoverage": <integer 0-100>,
   "missingKeywords": [
-    "<specific keyword from JD not in resume — be exact, e.g. 'Salesforce CPQ' not 'CRM tools'>",
+    "<specific keyword from JD not in resume - be exact, e.g. 'Salesforce CPQ' not 'CRM tools'>",
     ... up to 8 items
   ],
   "missingSkills": [
-    "<specific skill required by JD not in resume skills — be exact>",
+    "<specific skill required by JD not in resume skills - be exact>",
     ... up to 6 items
   ],
   "strengths": [
-    "<specific strength this resume has FOR THIS JD — reference actual content, e.g. '7 years of Apex development aligns with the Senior Developer requirement'>",
-    ... 3–4 items
+    "<specific strength this resume has FOR THIS JD - reference actual content, e.g. '7 years of Apex development aligns with the Senior Developer requirement'>",
+    ... 3-4 items
   ],
   "weaknesses": [
-    "<specific, actionable gap — tell the candidate EXACTLY what to fix, e.g. 'Your summary does not mention Salesforce Lightning which appears 4 times in the JD — add it in the first sentence'>",
-    ... 3–5 items
+    "<specific, actionable gap - tell the candidate EXACTLY what to fix, e.g. 'Your summary does not mention Salesforce Lightning which appears 4 times in the JD - add it in the first sentence'>",
+    ... 3-5 items
   ],
   "summarySuggestions": [
-    "<concrete instruction for improving the summary for this specific JD — e.g. 'Add the phrase cloud-based CRM architecture to your summary opening line'>",
-    ... 2–3 items
+    "<concrete instruction for improving the summary for this specific JD - e.g. 'Add the phrase cloud-based CRM architecture to your summary opening line'>",
+    ... 2-3 items
   ],
   "experienceSuggestions": [
-    "<specific instruction for an experience bullet — e.g. 'Under your Infosys role, add a bullet quantifying how many Salesforce orgs you managed'>",
-    ... 2–3 items
+    "<specific instruction for an experience bullet - e.g. 'Under your Infosys role, add a bullet quantifying how many Salesforce orgs you managed'>",
+    ... 2-3 items
   ]
 }`;
 
@@ -1681,7 +1352,7 @@ Return ONLY this JSON (no markdown fences):
             return res.status(500).json({ error: 'Failed to parse AI response.' });
         }
 
-        // Clamp scores to 0–100
+        // Clamp scores to 0-100
         ['atsScore','jdMatch','keywordCoverage','skillsCoverage'].forEach(k => {
             if (typeof result[k] === 'number') result[k] = Math.max(0, Math.min(100, Math.round(result[k])));
         });
@@ -1692,7 +1363,7 @@ Return ONLY this JSON (no markdown fences):
             if (!Array.isArray(result[k])) result[k] = [];
         });
 
-        console.log(`[${SERVER_VERSION}] /analyze-job-match — ATS:${result.atsScore} JD:${result.jdMatch}`);
+        console.log(`[${SERVER_VERSION}] /analyze-job-match - ATS:${result.atsScore} JD:${result.jdMatch}`);
         res.json(result);
 
     } catch (err) {
@@ -1701,10 +1372,10 @@ Return ONLY this JSON (no markdown fences):
     }
 });
 
-// ─── POST /optimize-for-job ───────────────────────────────────────────────────
+// --- POST /optimize-for-job -------------------------------------------------
 // Rewrites resume summary + experience bullets to target the JD
-// NEVER invents facts — only rephrases existing content
-// ─────────────────────────────────────────────────────────────────────────────
+// NEVER invents facts - only rephrases existing content
+// ----------------------------------------------------------------------------
 app.post('/optimize-for-job', async (req, res) => {
     try {
         const { resumeData, resumeText, jobDescription } = req.body;
@@ -1724,14 +1395,14 @@ app.post('/optimize-for-job', async (req, res) => {
         const systemPrompt = `You are an expert resume writer specialising in ATS optimisation.
 You rewrite resume content to better match a specific job description.
 
-ABSOLUTE RULES — breaking any of these makes the output worthless:
+ABSOLUTE RULES - breaking any of these makes the output worthless:
 1. NEVER invent companies, job titles, dates, degrees, or certifications
-2. NEVER add skills or achievements the candidate has not demonstrated  
+2. NEVER add skills or achievements the candidate has not demonstrated
 3. ONLY rephrase, reword, or restructure EXISTING content
-4. Incorporate JD keywords NATURALLY — never stuff them awkwardly
+4. Incorporate JD keywords NATURALLY - never stuff them awkwardly
 5. Use strong action verbs: Led, Architected, Delivered, Reduced, Increased, Launched, Scaled
-6. Keep bullets concise — maximum 130 characters each
-7. Return ONLY valid JSON — no markdown, no explanation`;
+6. Keep bullets concise - maximum 130 characters each
+7. Return ONLY valid JSON - no markdown, no explanation`;
 
         const userPrompt = `Optimise this resume for the job description below.
 
@@ -1742,9 +1413,9 @@ ${resumeString}
 ${jobDescription.trim().slice(0, 5000)}
 
 === INSTRUCTIONS ===
-1. Rewrite the professional summary (3–4 sentences) to open with the candidate's most relevant strength for this specific role, then incorporate the top 3–4 keywords from the JD naturally.
+1. Rewrite the professional summary (3-4 sentences) to open with the candidate's most relevant strength for this specific role, then incorporate the top 3-4 keywords from the JD naturally.
 2. For each experience role, rewrite or strengthen the bullet points to highlight achievements and responsibilities that align with the JD requirements. Do NOT add bullets that aren't based on existing content.
-3. Reorder the skills array so the most JD-relevant skills appear first. You may add 1–2 skills that are clearly implied by their experience (e.g. if they built Salesforce integrations, adding "REST API Integration" is fair).
+3. Reorder the skills array so the most JD-relevant skills appear first. You may add 1-2 skills that are clearly implied by their experience (e.g. if they built Salesforce integrations, adding "REST API Integration" is fair).
 4. Keep ALL company names, titles, dates, and education exactly as-is.
 
 Return ONLY this JSON:
@@ -1802,11 +1473,11 @@ Return ONLY this JSON:
 });
 
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  AUTH  —  Google OAuth · LinkedIn OAuth · Email Magic Link
-// ═══════════════════════════════════════════════════════════════════════════════
+// ============================================================================
+//  AUTH  -  Google OAuth . LinkedIn OAuth . Email Magic Link
+// ============================================================================
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// --- Helpers ----------------------------------------------------------------
 
 function dbRequired(res) {
     if (!db) { res.status(503).json({ error: 'Auth not configured (no DATABASE_URL).' }); return false; }
@@ -1858,10 +1529,10 @@ function authSuccessPage(token, user) {
         id: user.id, email: user.email, name: user.name,
         avatarUrl: user.avatar_url, plan: user.plan || 'free'
     }).replace(/</g, '\\u003c').replace(/>/g, '\\u003e');
-    return `<!DOCTYPE html><html><head><title>Signing in…</title>
+    return `<!DOCTYPE html><html><head><title>Signing in...</title>
 <style>*{margin:0}body{font-family:system-ui,sans-serif;background:#0b0c1a;color:#fff;height:100vh;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:14px}
 .ring{width:40px;height:40px;border:3px solid #7c3aed;border-top-color:transparent;border-radius:50%;animation:s .8s linear infinite}@keyframes s{to{transform:rotate(360deg)}}</style></head>
-<body><div class="ring"></div><p style="font-size:14px;color:rgba(255,255,255,0.5)">Signing you in…</p>
+<body><div class="ring"></div><p style="font-size:14px;color:rgba(255,255,255,0.5)">Signing you in...</p>
 <script>
 (function(){
   try{ window.opener && window.opener.postMessage({type:'RENONYM_AUTH_SUCCESS',token:'TOKEN',user:USER},'FRONTEND'); }catch(e){}
@@ -1884,7 +1555,7 @@ setTimeout(function(){try{window.close();}catch(e){}},3000);
 </script></body></html>`.replace(/FRONTEND/g, FRONTEND_URL);
 }
 
-// ─── Google OAuth ──────────────────────────────────────────────────────────────
+// --- Google OAuth -----------------------------------------------------------
 
 app.get('/auth/google', (req, res) => {
     if (!GOOGLE_ID) return res.send(authErrorPage('Google OAuth not configured on server.'));
@@ -1937,7 +1608,7 @@ app.get('/auth/google/callback', async (req, res) => {
     }
 });
 
-// ─── LinkedIn OAuth ────────────────────────────────────────────────────────────
+// --- LinkedIn OAuth ---------------------------------------------------------
 
 app.get('/auth/linkedin', (req, res) => {
     if (!LINKEDIN_ID) return res.send(authErrorPage('LinkedIn OAuth not configured on server.'));
@@ -1987,7 +1658,7 @@ app.get('/auth/linkedin/callback', async (req, res) => {
     }
 });
 
-// ─── Magic Link ────────────────────────────────────────────────────────────────
+// --- Magic Link -------------------------------------------------------------
 
 app.post('/auth/magic-link/request', async (req, res) => {
     if (!dbRequired(res)) return;
@@ -2059,7 +1730,7 @@ app.get('/auth/magic-link/verify', async (req, res) => {
     }
 });
 
-// ─── Session endpoints ─────────────────────────────────────────────────────────
+// --- Session endpoints ------------------------------------------------------
 
 app.get('/auth/me', requireAuth, async (req, res) => {
     if (!dbRequired(res)) return;
@@ -2074,14 +1745,14 @@ app.get('/auth/me', requireAuth, async (req, res) => {
 });
 
 
-// ─── Auth polling — LWC Locker Service safe alternative to postMessage ────────
+// --- Auth polling - LWC Locker Service safe alternative to postMessage -------
 // LWC cannot use window.addEventListener('message') due to Locker Service.
 // Instead: LWC polls this endpoint every 1.5s after opening the OAuth popup.
-// Flow: LWC calls /auth/init-poll → gets nonce → opens popup with nonce
-//       → server stores JWT by nonce after OAuth → LWC polls /auth/poll?nonce
-//       → returns JWT when ready → LWC stores token and updates state
+// Flow: LWC calls /auth/init-poll -> gets nonce -> opens popup with nonce
+//       -> server stores JWT by nonce after OAuth -> LWC polls /auth/poll?nonce
+//       -> returns JWT when ready -> LWC stores token and updates state
 
-const pendingAuthSessions = new Map(); // nonce → { token, user } or null
+const pendingAuthSessions = new Map(); // nonce -> { token, user } or null
 
 // Clean up stale nonces every 5 minutes
 setInterval(() => {
@@ -2116,7 +1787,7 @@ app.post('/auth/logout', requireAuth, (req, res) => {
     res.json({ success: true });
 });
 
-// ─── Save Resume (requires auth) ──────────────────────────────────────────────
+// --- Save Resume (requires auth) --------------------------------------------
 
 app.post('/auth/save-resume', requireAuth, async (req, res) => {
     if (!dbRequired(res)) return;
@@ -2172,7 +1843,7 @@ app.post('/auth/save-ats-report', requireAuth, async (req, res) => {
     } catch (e) { res.status(500).json({ error: 'Failed to save ATS report.' }); }
 });
 
-// ─── Calorie Calculator ────────────────────────────────────────────────────────
+// --- Calorie Calculator -----------------------------------------------------
 
 app.post('/analyze-food', async (req, res) => {
     try {
@@ -2216,9 +1887,9 @@ If no food visible: {"error":"No food detected."}` }
 
 
 
-// ═════════════════════════════════════════════════════════════════════════════
-// RAZORPAY — PAYMENT INTEGRATION
-// ═════════════════════════════════════════════════════════════════════════════
+// ============================================================================
+// RAZORPAY - PAYMENT INTEGRATION
+// ============================================================================
 
 const PLANS = {
     pro_monthly:  { amount: 59900,  label: 'Pro Monthly',  currency: 'INR' },
@@ -2228,7 +1899,7 @@ const PLANS = {
 };
 
 // POST /create-order
-// Creates a Razorpay order server-side — key_secret never leaves the server
+// Creates a Razorpay order server-side - key_secret never leaves the server
 app.post('/create-order', async (req, res) => {
     try {
         const { planId, userId } = req.body;
@@ -2265,14 +1936,14 @@ app.post('/create-order', async (req, res) => {
     } catch (err) {
         console.error(`[${SERVER_VERSION}] create-order error:`, err.message);
         if (err.statusCode === 401) {
-            return res.status(401).json({ error: 'Razorpay auth failed — check credentials' });
+            return res.status(401).json({ error: 'Razorpay auth failed - check credentials' });
         }
         res.status(500).json({ error: 'Failed to create order', details: err.message });
     }
 });
 
 // POST /verify-payment
-// Verifies Razorpay signature using HMAC-SHA256 — never trust client-side success alone
+// Verifies Razorpay signature using HMAC-SHA256 - never trust client-side success alone
 app.post('/verify-payment', async (req, res) => {
     try {
         const { razorpay_order_id, razorpay_payment_id, razorpay_signature, planId, userId } = req.body;
@@ -2293,7 +1964,7 @@ app.post('/verify-payment', async (req, res) => {
             return res.status(400).json({ error: 'Invalid payment signature' });
         }
 
-        // Signature valid — upgrade user plan if authenticated
+        // Signature valid - upgrade user plan if authenticated
         const plan = PLANS[planId];
         console.log(`[${SERVER_VERSION}] Payment verified: order=${razorpay_order_id} payment=${razorpay_payment_id} plan=${planId}`);
 
@@ -2312,7 +1983,7 @@ app.post('/verify-payment', async (req, res) => {
                 );
                 console.log(`[${SERVER_VERSION}] User ${userId} upgraded to pro until ${expiresAt}`);
             } catch (dbErr) {
-                // DB update failed — log but don't fail the response
+                // DB update failed - log but don't fail the response
                 // Payment was real; retry upgrade on next login
                 console.error(`[${SERVER_VERSION}] DB upgrade failed:`, dbErr.message);
             }
