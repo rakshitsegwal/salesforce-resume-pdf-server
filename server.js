@@ -74,7 +74,7 @@ app.use(
 );
 
 // --- Version marker ---------------------------------------------------------
-const SERVER_VERSION = 'v12.0-coach-2026';
+const SERVER_VERSION = 'v12.1-coach-2026';
 const BOOT_TIME      = Date.now();
 
 // --- Auth config ------------------------------------------------------------
@@ -222,7 +222,8 @@ const aiLimiter = rateLimit({
 
 const exportLimiter = rateLimit({
     windowMs: 60 * 60 * 1000,   // 1 hour
-    max: 5,                      // 5 PDF exports per IP per hour
+    max: 20,                     // per IP — generous for Pro users / shared NATs
+    skipFailedRequests: true,    // a failed render must not burn an export slot
     message: { error: 'PDF export limit reached. Please try again later.' }
 });
 
@@ -597,19 +598,27 @@ html, body {
     float: none !important;
 }
 
-/* -- 8. Single-column layout (when layout != two-col) ------------------- */
+/* -- 8. Non-two-col layouts: undo the section-5 grid lock ---------------- */
+/* Each AI layout keeps its own structure in the PDF — single/banner are
+   block flows, asymmetric keeps its 35%/65% split.                         */
 .rb-resume--layout-single .rb-resume__body,
-.rb-resume--layout-single-ai .rb-resume__body {
+.rb-resume--layout-single-ai .rb-resume__body,
+.rb-resume--layout-banner .rb-resume__body {
     display: block !important;
     grid-template-columns: unset !important;
 }
+.rb-resume--layout-asymmetric .rb-resume__body {
+    grid-template-columns: 35% 65% !important;
+}
 .rb-resume--layout-single .rb-resume__sidebar,
-.rb-resume--layout-single-ai .rb-resume__sidebar {
+.rb-resume--layout-single-ai .rb-resume__sidebar,
+.rb-resume--layout-banner .rb-resume__sidebar {
     grid-column: unset !important;
     width: 100% !important;
 }
 .rb-resume--layout-single .rb-resume__main,
-.rb-resume--layout-single-ai .rb-resume__main {
+.rb-resume--layout-single-ai .rb-resume__main,
+.rb-resume--layout-banner .rb-resume__main {
     grid-column: unset !important;
     width: 100% !important;
 }
@@ -646,27 +655,33 @@ html, body {
 .rb-resume .rb-skill-pill {
     display: inline-flex !important;
     align-items: center !important;
-    white-space: nowrap !important;
+    white-space: normal !important;   /* a 40+ char skill wraps inside the pill, never crosses the page edge */
     overflow: visible !important;
     height: auto !important;
-    flex: 0 0 auto !important;
+    flex: 0 1 auto !important;
+    max-width: 100% !important;
 }
 
-/* -- 10. Bullet lists: prevent overlap with list markers ---------------- */
+/* -- 10. Bullet lists: keep the client's middot markers, just wrap text -- */
+/* (forcing disc here used to double up with the client's li::before middot) */
 .rb-resume .rb-exp-bullets {
     display: block !important;
-    list-style: disc outside !important;
-    list-style-position: outside !important;
-    padding-left: 16px !important;
     overflow: visible !important;
     height: auto !important;
 }
 .rb-resume .rb-exp-bullets li {
-    display: list-item !important;
+    display: block !important;        /* no native marker — the client's ::before middot is the only bullet */
     overflow: visible !important;
     height: auto !important;
     word-break: normal !important;
     overflow-wrap: break-word !important;
+}
+
+/* -- 10b. No unbroken string may escape the 794px page ------------------- */
+.rb-resume p, .rb-resume span, .rb-resume div, .rb-resume li,
+.rb-resume h1, .rb-resume h2, .rb-resume h3 {
+    overflow-wrap: anywhere !important;
+    word-break: break-word !important;
 }
 
 /* -- 11. Prevent page breaks INSIDE key elements ------------------------ */
@@ -690,16 +705,35 @@ html, body {
 // ----------------------------------------------------------------------------
 // POST /generate-pdf
 // ----------------------------------------------------------------------------
-// Strips dangerous HTML tags from PDF payload before Puppeteer renders it
+// Strips dangerous HTML tags from PDF payload before Puppeteer renders it.
+// Cap is generous (6MB) because résumés can carry a base64 photo data-URL.
 function sanitizePdfHtml(html) {
     if (!html) return '';
-    return html
+    let out = String(html)
         .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '')
         .replace(/<iframe\b[^>]*>.*?<\/iframe>/gi, '')
-        .replace(/on\w+\s*=\s*["'][^"']*["']/gi, '')       // strip inline handlers
-        .replace(/javascript\s*:/gi, '')                      // strip js: hrefs
-        .replace(/<link[^>]+rel\s*=\s*["']?import["']?[^>]*>/gi, '') // strip imports
-        .slice(0, 500000);  // hard cap: 500kb of HTML max
+        .replace(/<link[^>]+rel\s*=\s*["']?import["']?[^>]*>/gi, '');
+    // Strip inline handlers / js: URLs ONLY inside tags — a résumé summary that
+    // literally says "JavaScript: built SPAs" must come through untouched.
+    let prev;
+    do { prev = out; out = out.replace(/<([a-zA-Z][^>]*?)\son\w+\s*=\s*("[^"]*"|'[^']*')/g, '<$1'); } while (out !== prev);
+    out = out.replace(/\b(href|src)\s*=\s*(["'])\s*javascript\s*:[^"']*\2/gi, '$1=$2#$2');
+    return out.slice(0, 6_000_000);
+}
+
+// Chromium concurrency gate — each render launches a full browser (~300MB).
+// 2 run at once; up to 6 wait their turn; beyond that we say "busy" instead
+// of OOM-killing the Railway instance.
+let pdfActive = 0;
+const pdfWaiters = [];
+function acquirePdfSlot() {
+    if (pdfActive < 2) { pdfActive++; return Promise.resolve(true); }
+    if (pdfWaiters.length >= 6) return Promise.resolve(false);
+    return new Promise(resolve => pdfWaiters.push(resolve));
+}
+function releasePdfSlot() {
+    const next = pdfWaiters.shift();
+    if (next) next(true); else pdfActive = Math.max(0, pdfActive - 1);
 }
 
 app.post('/generate-pdf', async (req, res) => {
@@ -709,10 +743,18 @@ app.post('/generate-pdf', async (req, res) => {
         cssLen:  req.body?.css?.length
     });
 
+    const rawHtml = req.body && req.body.html;
+    if (!rawHtml || String(rawHtml).trim().length < 50) {
+        return res.status(400).json({ error: 'Nothing to export — the resume preview was empty.' });
+    }
+    const html = sanitizePdfHtml(String(rawHtml));
+    const css  = String((req.body && req.body.css) || '').slice(0, 1_500_000);
+
+    const slot = await acquirePdfSlot();
+    if (!slot) return res.status(503).json({ error: 'Export queue is full — please try again in a few seconds.' });
+
     let browser = null;   // closed in finally — error paths must not leak Chromium
     try {
-        const { html, css } = req.body;
-
         browser = await puppeteer.launch({
             headless: true,
             args: [
@@ -745,9 +787,15 @@ app.post('/generate-pdf', async (req, res) => {
 </body>
 </html>`;
 
-        await page.setContent(fullHtml, { waitUntil: 'networkidle0' });
+        // domcontentloaded + a BOUNDED font wait: a slow/hung Google Fonts CDN
+        // degrades to fallback fonts instead of timing out the whole export
+        // (networkidle0 made third-party font availability a hard dependency).
+        await page.setContent(fullHtml, { waitUntil: 'domcontentloaded', timeout: 20000 });
         await page.emulateMediaType('screen');
-        await page.evaluateHandle('document.fonts.ready');
+        await Promise.race([
+            page.evaluateHandle('document.fonts.ready').catch(() => {}),
+            new Promise(r => setTimeout(r, 8000)),
+        ]);
 
         // Settle: fonts + any deferred layout reflows
         await new Promise(r => setTimeout(r, 600));
@@ -830,6 +878,7 @@ app.post('/generate-pdf', async (req, res) => {
         console.error('PDF generation error:', e);
         if (!res.headersSent) res.status(500).send('PDF generation failed');
     } finally {
+        releasePdfSlot();
         if (browser) await browser.close().catch(() => {});
     }
 });
@@ -1083,7 +1132,7 @@ app.post('/generate-template', async (req, res) => {
             inspirationBase64 &&
             inspirationMimeType &&
             (inspirationMimeType.startsWith('image/') || inspirationMimeType === 'application/pdf') &&
-            inspirationBase64.length < 4 * 1024 * 1024  // 4MB base64 limit
+            inspirationBase64.length < 7_200_000  // ~5MB raw → ~6.7M base64; matches the client's 5MB cap
         );
 
         // -- Step 1: If inspiration image provided, vision-analyse it first --
@@ -1233,14 +1282,16 @@ Return the design tokens as JSON only.`;
             res.locals.aiFallback = true;   // don't charge quota for a default theme
         }
 
-        console.log(`[${SERVER_VERSION}] /generate-template -> layout=${detectedLayout} accent=${tokens.accent}`);
-        res.json({ tokens, layout: detectedLayout });
+        console.log(`[${SERVER_VERSION}] /generate-template -> layout=${detectedLayout} accent=${tokens.accent}${res.locals.aiFallback ? ' (FALLBACK)' : ''}`);
+        // fallback:true lets the client say "applied a safe default" instead of
+        // claiming a custom theme was generated.
+        res.json({ tokens, layout: detectedLayout, fallback: !!res.locals.aiFallback });
 
     } catch (e) {
         console.error('Template generation error:', e);
         // Even on an unexpected error, hand back a usable theme rather than 500
         res.locals.aiFallback = true;
-        res.json({ tokens: { ...DEFAULT_TOKENS }, layout: 'two-col' });
+        res.json({ tokens: { ...DEFAULT_TOKENS }, layout: 'two-col', fallback: true });
     }
 });
 
@@ -2552,7 +2603,14 @@ app.post('/coach/sessions/:id/transcribe', requireAuth, coachMediaLimiter,
 
 app.use((err, req, res, next) => {
     console.error(err);
-    if (!res.headersSent) res.status(500).json({ error: 'Something went wrong.' });
+    if (res.headersSent) return;
+    if (err && err.type === 'entity.too.large') {
+        return res.status(413).json({ error: 'That upload is too large. Try a smaller file or shorter content.' });
+    }
+    if (err && err.type === 'entity.parse.failed') {
+        return res.status(400).json({ error: 'Malformed request.' });
+    }
+    res.status(500).json({ error: 'Something went wrong.' });
 });
 
 // Don't serve requests before tables exist on a cold start; schema failures
