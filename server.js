@@ -76,7 +76,7 @@ app.use(
 );
 
 // --- Version marker ---------------------------------------------------------
-const SERVER_VERSION = 'v14.2-credits-2026';
+const SERVER_VERSION = 'v14.3-credits-2026';
 const BOOT_TIME      = Date.now();
 
 // --- Auth config ------------------------------------------------------------
@@ -594,7 +594,7 @@ app.use('/generate-template',   requirePremiumAuth, requireCredits(1));
 app.use('/review-resume',       requirePremiumAuth, requireCredits(1));
 app.use('/improve-summary',     requirePremiumAuth, requireCredits(1));   // was reachable anonymously — closed
 app.use('/optimize-for-job',    requirePremiumAuth, requireCredits(1));   // was reachable anonymously — closed
-app.use('/analyze-job-match',   requirePremiumAuth);
+app.use('/analyze-job-match',   optionalAuth);   // anonymous gets a teaser; signed-in gets the full report
 app.use('/generate-pdf',        requirePremiumAuth, requireTemplateEntitlement);
 
 // Payment endpoints - rate limited + session validated
@@ -1751,7 +1751,16 @@ Return ONLY this JSON (no markdown fences):
             if (!Array.isArray(result[k])) result[k] = [];
         });
 
-        console.log(`[${SERVER_VERSION}] /analyze-job-match - ATS:${result.atsScore} JD:${result.jdMatch}`);
+        console.log(`[${SERVER_VERSION}] /analyze-job-match - ATS:${result.atsScore} JD:${result.jdMatch}${req.user ? '' : ' (anon teaser)'}`);
+        if (!req.user) {
+            // anonymous teaser: scores + top-3 gaps — the full report is the
+            // signup hook (free account + 2 starter credits)
+            return res.json({
+                atsScore: result.atsScore, jdMatch: result.jdMatch,
+                missingKeywords: (result.missingKeywords || []).slice(0, 3),
+                locked: true,
+            });
+        }
         res.json(result);
 
     } catch (err) {
@@ -1878,6 +1887,17 @@ function signToken(user) {
         JWT_SECRET,
         { expiresIn: JWT_EXPIRES }
     );
+}
+
+// Attaches req.user when a valid Bearer token is present; never rejects.
+// Used by routes that serve a TEASER to anonymous callers (JD match).
+function optionalAuth(req, res, next) {
+    try {
+        const header = req.headers['authorization'] || '';
+        const token  = header.startsWith('Bearer ') ? header.slice(7) : null;
+        if (token) req.user = jwt.verify(token, JWT_SECRET);
+    } catch (_) { /* anonymous */ }
+    next();
 }
 
 function requireAuth(req, res, next) {
