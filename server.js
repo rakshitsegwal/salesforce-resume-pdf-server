@@ -74,7 +74,7 @@ app.use(
 );
 
 // --- Version marker ---------------------------------------------------------
-const SERVER_VERSION = 'v11.3-coach-2026';
+const SERVER_VERSION = 'v11.4-coach-2026';
 const BOOT_TIME      = Date.now();
 
 // --- Auth config ------------------------------------------------------------
@@ -2264,14 +2264,11 @@ app.post('/coach/sessions', requireAuth, async (req, res) => {
         const { resumeData, company, jobTitle, jobDescription, interviewType, difficulty, mode, length } = req.body;
         if (!jobDescription || jobDescription.trim().length < 30) return res.status(400).json({ error: 'Add a job description (min 30 chars).' });
 
-        // Entitlement: Unlimited → allow; else consume one Session Pass; else gate.
+        // Entitlement: Unlimited → allow; else a Session Pass is consumed — but only
+        // AFTER question generation succeeds, so an AI failure never burns a pass.
         const ur = await db.query('SELECT coach_plan, coach_expires, session_passes FROM rn_users WHERE id=$1', [req.user.id]);
         const acc = coachAccess(ur.rows[0] || {});
         if (!acc.has) return res.status(402).json({ error: 'The Interview Coach is a premium feature. Choose a plan to start.', code: 'PRO_REQUIRED' });
-        if (!acc.unlimited) {
-            const dec = await db.query('UPDATE rn_users SET session_passes = session_passes - 1 WHERE id=$1 AND session_passes > 0', [req.user.id]);
-            if (!dec.rowCount) return res.status(402).json({ error: 'No session passes left.', code: 'PRO_REQUIRED' });
-        }
 
         const type  = COACH_TYPES.includes(interviewType) ? interviewType : 'Behavioral';
         const count = [5, 6, 10].includes(length) ? length : 6;
@@ -2284,6 +2281,12 @@ app.post('/coach/sessions', requireAuth, async (req, res) => {
         } catch (aiErr) {
             console.error('[coach] question gen failed:', aiErr.message);
             return res.status(502).json({ error: 'Could not generate questions. Please try again.' });
+        }
+        if (!questions.length) return res.status(502).json({ error: 'Could not generate questions. Please try again.' });
+
+        if (!acc.unlimited) {
+            const dec = await db.query('UPDATE rn_users SET session_passes = session_passes - 1 WHERE id=$1 AND session_passes > 0', [req.user.id]);
+            if (!dec.rowCount) return res.status(402).json({ error: 'No session passes left.', code: 'PRO_REQUIRED' });
         }
 
         const ins = await db.query(
@@ -2345,10 +2348,17 @@ app.post('/coach/sessions/:id/score', requireAuth, async (req, res) => {
 
         const questions = Array.isArray(s.questions) ? s.questions : [];
         const answers   = Array.isArray(s.answers) ? s.answers : [];
+        // Latest answer wins per question; legacy voice placeholders don't count.
+        const lastByQ = {};
+        for (const a of answers) if (a && a.questionId) lastByQ[a.questionId] = a;
+        const isRealAnswer = t => t && String(t).trim() && !String(t).startsWith('[Spoken answer');
         const qa = questions.map(q => ({
             focus: q.focus, text: q.text,
-            answer: (answers.find(a => a.questionId === q.id) || {}).text || ''
+            answer: (lastByQ[q.id] && isRealAnswer(lastByQ[q.id].text)) ? lastByQ[q.id].text : ''
         }));
+        if (!qa.some(x => x.answer)) {
+            return res.status(400).json({ error: 'No answers were recorded for this interview. Resume it and answer at least one question, then generate the report.' });
+        }
         const resumeString = serializeResumeData(s.resume_snapshot);
         let report;
         try {
