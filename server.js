@@ -74,7 +74,7 @@ app.use(
 );
 
 // --- Version marker ---------------------------------------------------------
-const SERVER_VERSION = 'v12.2-coach-2026';
+const SERVER_VERSION = 'v12.3-coach-2026';
 const BOOT_TIME      = Date.now();
 
 // --- Auth config ------------------------------------------------------------
@@ -2323,9 +2323,13 @@ function coachAccess(u) {
 // Generate interview questions tailored to the résumé + JD + config.
 async function coachGenerateQuestions({ resumeString, company, jobTitle, jobDescription, interviewType, difficulty, count }) {
     const sys = `You are an elite interviewer running a realistic ${interviewType} interview for the role below.
-Generate exactly ${count} questions, ordered from warm-up to hardest, tailored to THIS candidate's résumé and THIS job.
+Generate exactly ${count} questions, ordered from warm-up to hardest.
 Difficulty ${difficulty}/100 (higher = sharper, more probing, more quantitative).
-Questions must reference the candidate's actual experience and the job's real requirements — never generic.
+
+BALANCE REQUIREMENT — this is what makes the interview feel real:
+- At least HALF the questions must directly probe specific requirements, responsibilities, technologies, or qualifications stated in the JOB DESCRIPTION (name them explicitly in the question, the way the hiring manager who wrote the JD would).
+- The remaining questions connect the candidate's actual résumé experience to THIS role — gaps between their background and the JD's demands are prime material.
+- If the job description names concrete skills/tools/duties, they MUST appear across the question set. Never produce a question that could have been written without reading the JD.
 Return ONLY JSON: {"questions":[{"text":"...","focus":"2-4 word tag","hint":"the single key phrase in the question to emphasise"}]}`;
     const user = `=== ROLE ===\n${sanitizeInput(jobTitle)} at ${sanitizeInput(company)}\n\n=== JOB DESCRIPTION ===\n${truncateText(jobDescription, 4000)}\n\n=== CANDIDATE RÉSUMÉ ===\n${truncateText(resumeString, 6000)}\n\nReturn ${count} questions as JSON.`;
     const c = await openai.chat.completions.create({
