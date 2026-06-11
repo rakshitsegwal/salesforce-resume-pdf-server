@@ -74,7 +74,7 @@ app.use(
 );
 
 // --- Version marker ---------------------------------------------------------
-const SERVER_VERSION = 'v11.6-coach-2026';
+const SERVER_VERSION = 'v12.0-coach-2026';
 const BOOT_TIME      = Date.now();
 
 // --- Auth config ------------------------------------------------------------
@@ -247,6 +247,14 @@ const pollLimiter = rateLimit({
     windowMs: 5 * 60 * 1000,
     max: 250,                    // Google polls every 1.5s (~200/5min) + magic-link every 6s — both must fit
     message: { error: 'Too many poll requests.' }
+});
+
+// Coach audio (TTS questions + transcription) — cheap per call, but bounded.
+// A 10-question interview with repeats ≈ 25-40 calls; 120 leaves headroom.
+const coachMediaLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 120,
+    message: { error: 'Too many audio requests. Please slow down a little.' }
 });
 
 // --- Per-clientId rate limiter (second line of defence) ---------------------
@@ -2468,6 +2476,76 @@ app.post('/coach/sessions/:id/score', requireAuth, aiLimiter, async (req, res) =
     } catch (e) {
         console.error('[coach] score error:', e.message);
         res.status(500).json({ error: 'Failed to generate report.' });
+    }
+});
+
+// ── Coach audio — the interviewer's voice + spoken-answer transcription ─────
+// The frontend falls back to browser speechSynthesis / SpeechRecognition if
+// either endpoint fails, so neither is a single point of failure.
+
+// Speak a question aloud (AI interviewer voice). Returns MP3.
+app.post('/coach/sessions/:id/question-audio', requireAuth, coachMediaLimiter, async (req, res) => {
+    if (!db) return res.status(503).json({ error: 'Coach not configured.' });
+    if (!UUID_RE.test(req.params.id)) return res.status(404).json({ error: 'Session not found.' });
+    try {
+        const { questionId } = req.body || {};
+        const r = await db.query('SELECT questions FROM rn_interview_sessions WHERE id=$1 AND user_id=$2', [req.params.id, req.user.id]);
+        if (!r.rows.length) return res.status(404).json({ error: 'Session not found.' });
+        const questions = Array.isArray(r.rows[0].questions) ? r.rows[0].questions : [];
+        const q = questions.find(x => x.id === String(questionId || ''));
+        if (!q) return res.status(404).json({ error: 'Question not found.' });
+
+        const text = String(q.text).slice(0, 600);
+        let speech;
+        try {
+            speech = await openai.audio.speech.create({
+                model: 'gpt-4o-mini-tts', voice: 'onyx', input: text, response_format: 'mp3',
+                instructions: 'You are a calm, professional job interviewer. Speak clearly at a natural, unhurried pace.',
+            });
+        } catch (e) {
+            speech = await openai.audio.speech.create({ model: 'tts-1', voice: 'onyx', input: text, response_format: 'mp3' });
+        }
+        const buf = Buffer.from(await speech.arrayBuffer());
+        res.set({ 'Content-Type': 'audio/mpeg', 'Content-Length': buf.length, 'Cache-Control': 'private, max-age=3600' });
+        res.send(buf);
+    } catch (e) {
+        console.error('[coach] tts error:', e.message);
+        res.status(502).json({ error: 'Could not generate question audio.' });
+    }
+});
+
+// Transcribe a spoken answer (raw audio body, ≤16MB). Returns { text }.
+app.post('/coach/sessions/:id/transcribe', requireAuth, coachMediaLimiter,
+    express.raw({ type: ['audio/*', 'video/webm', 'application/octet-stream'], limit: '16mb' }),
+    async (req, res) => {
+    if (!db) return res.status(503).json({ error: 'Coach not configured.' });
+    if (!UUID_RE.test(req.params.id)) return res.status(404).json({ error: 'Session not found.' });
+    try {
+        if (!Buffer.isBuffer(req.body) || req.body.length < 200) return res.status(400).json({ error: 'No audio received.' });
+        const own = await db.query('SELECT id FROM rn_interview_sessions WHERE id=$1 AND user_id=$2', [req.params.id, req.user.id]);
+        if (!own.rows.length) return res.status(404).json({ error: 'Session not found.' });
+
+        const ct  = String(req.headers['content-type'] || 'audio/webm').toLowerCase();
+        const ext = ct.includes('mp4') || ct.includes('m4a') ? 'mp4'
+                  : ct.includes('ogg') ? 'ogg'
+                  : ct.includes('mpeg') || ct.includes('mp3') ? 'mp3'
+                  : ct.includes('wav') ? 'wav' : 'webm';
+        const mime = ct.split(';')[0];
+
+        let tr;
+        try {
+            const file = await OpenAI.toFile(req.body, `answer.${ext}`, { type: mime });
+            tr = await openai.audio.transcriptions.create({ file, model: 'gpt-4o-mini-transcribe' });
+        } catch (e) {
+            const file2 = await OpenAI.toFile(req.body, `answer.${ext}`, { type: mime });
+            tr = await openai.audio.transcriptions.create({ file: file2, model: 'whisper-1' });
+        }
+        const text = String((tr && tr.text) || '').trim().slice(0, 6000);
+        console.log(`[${SERVER_VERSION}] [coach] transcribed ${Math.round(req.body.length / 1024)}KB → ${text.length} chars`);
+        res.json({ text });
+    } catch (e) {
+        console.error('[coach] transcribe error:', e.message);
+        res.status(502).json({ error: 'Could not transcribe your answer.' });
     }
 });
 
