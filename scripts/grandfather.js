@@ -29,6 +29,26 @@ const makeReferralCode = () =>
 (async () => {
     console.log(`Grandfather migration — ${APPLY ? 'APPLY' : 'DRY RUN (pass --apply to write)'}\n`);
 
+    // 0. Starter credits for EVERY existing account (new signups get +2
+    //    automatically; this backfills the accounts that predate the ladder).
+    //    REQUIRED alongside the v14 deploy — without it, existing free users
+    //    have zero credits and every AI action 402s.
+    const starters = await db.query(
+        `SELECT id, email FROM rn_users WHERE signup_credits_granted = FALSE`);
+    console.log(`Existing accounts needing starter credits: ${starters.rows.length}`);
+    for (const u of starters.rows) {
+        console.log(`  • ${u.email} — +3 starter credits`);
+        if (APPLY) {
+            await db.query(
+                `WITH flag AS (
+                    UPDATE rn_users SET signup_credits_granted = TRUE, credit_balance = credit_balance + 3, updated_at = NOW()
+                    WHERE id = $1 AND signup_credits_granted = FALSE RETURNING id
+                )
+                INSERT INTO rn_credit_ledger(user_id, delta, reason, ref_id)
+                SELECT id, 3, 'migration:v14-free', 'migration-v14' FROM flag`, [u.id]);
+        }
+    }
+
     // 1. Active unlimited users → +20 credits + flag
     const unlimited = await db.query(
         `SELECT id, email, name, coach_expires FROM rn_users

@@ -76,7 +76,7 @@ app.use(
 );
 
 // --- Version marker ---------------------------------------------------------
-const SERVER_VERSION = 'v14.0-credits-2026';
+const SERVER_VERSION = 'v14.2-credits-2026';
 const BOOT_TIME      = Date.now();
 
 // --- Auth config ------------------------------------------------------------
@@ -258,6 +258,9 @@ if (process.env.DATABASE_URL) {
             created_at      TIMESTAMPTZ DEFAULT NOW()
         );
         CREATE INDEX IF NOT EXISTS idx_rn_credit_ledger_user ON rn_credit_ledger(user_id, created_at DESC);
+        -- one purchase grant per payment id — retries can never double-grant
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_rn_credit_ledger_purchase
+            ON rn_credit_ledger(ref_id) WHERE reason LIKE 'purchase:%' AND ref_id IS NOT NULL;
         -- Free first interview produces a PARTIAL report until unlocked.
         ALTER TABLE rn_interview_sessions ADD COLUMN IF NOT EXISTS is_free_session BOOLEAN DEFAULT FALSE;
         ALTER TABLE rn_interview_sessions ADD COLUMN IF NOT EXISTS report_unlocked BOOLEAN DEFAULT TRUE;
@@ -486,6 +489,83 @@ async function enforceDailyQuota(req, res, next) {
     }
 }
 
+// ── v14 credits: charge per output-improving AI action ──────────────────────
+// Pass (season/placement) or legacy paid (pro / unexpired Coach Unlimited)
+// bypasses entirely. Debit happens ONLY after a successful AI response —
+// failures and default-token fallbacks never charge.
+function requireCredits(n) {
+    return async function (req, res, next) {
+        if (!db) return next();
+        try {
+            await expireStaleCredits(req.user.id);
+            const r = await db.query(
+                `SELECT credit_balance, plan, coach_plan, coach_expires, pass_type, pass_expires_at
+                 FROM rn_users WHERE id = $1`, [req.user.id]);
+            if (!r.rows.length) return res.status(401).json({ error: 'Account not found.', code: 'AUTH_REQUIRED' });
+            const u = r.rows[0];
+            if (hasActivePass(u) || u.plan === 'pro' || coachAccess(u).unlimited) return next();
+            if ((u.credit_balance || 0) < n) {
+                const t = await db.query(
+                    `SELECT COUNT(*)::int AS n FROM rn_credit_ledger WHERE user_id=$1 AND delta < 0 AND reason LIKE 'spend:%'`,
+                    [req.user.id]).catch(() => ({ rows: [{ n: 0 }] }));
+                return res.status(402).json({
+                    error: `You're out of credits — this needs ${n}.`,
+                    code: 'CREDITS_REQUIRED',
+                    balance: u.credit_balance || 0, needed: n, actionsUsed: t.rows[0].n,
+                });
+            }
+            const reason = ('spend:' + (req.baseUrl || req.path)).slice(0, 50);   // baseUrl is reset by finish-time
+            res.on('finish', async () => {
+                if (res.statusCode >= 200 && res.statusCode < 300 && !res.locals.aiFallback) {
+                    try {
+                        // conditional debit FIRST — ledger row only when it landed,
+                        // so parallel requests can't drive ledger and balance apart
+                        const d = await db.query(
+                            `UPDATE rn_users SET credit_balance = credit_balance - $2, updated_at = NOW()
+                             WHERE id = $1 AND credit_balance >= $2`, [req.user.id, n]);
+                        if (d.rowCount) {
+                            await db.query(
+                                `INSERT INTO rn_credit_ledger(user_id, delta, reason) VALUES($1, $2, $3)`,
+                                [req.user.id, -n, reason]);
+                        } else {
+                            console.warn(`[credits] raced to zero — action delivered uncharged for ${req.user.id}`);
+                        }
+                    } catch (e) { console.error('[credits] debit failed:', e.message); }
+                }
+            });
+            return next();
+        } catch (e) { console.error('[credits] check failed (fail-open):', e.message); return next(); }
+    };
+}
+
+// ── v14 PDF export: gated by TEMPLATE, not plan. Free templates (and AI
+// styles, which already cost a credit to generate) export clean for any
+// signed-in user; the 7 premium templates need an active pass / legacy paid.
+const FREE_TEMPLATES = ['sf-classic', 'sf-minimal', 'nordic-clean'];
+async function requireTemplateEntitlement(req, res, next) {
+    if (!db) return next();
+    try {
+        const html = String((req.body && req.body.html) || '');
+        // AI-styled exports are always allowed — generating the style already
+        // cost a credit. (Check the marker class explicitly: the base template
+        // class appears FIRST in the class list, so a capture-group sniff alone
+        // would wrongly bill AI styles applied over premium bases.)
+        if (/rb-resume--ai-(tokens|generated)/i.test(html)) return next();
+        const m = html.match(/rb-resume--([a-z0-9-]+)/i);
+        const effective = (m ? m[1].toLowerCase() : '') || String((req.body && req.body.templateStyle) || '').toLowerCase();
+        if (!effective || FREE_TEMPLATES.includes(effective)) return next();
+        const r = await db.query(
+            'SELECT plan, coach_plan, coach_expires, pass_type, pass_expires_at FROM rn_users WHERE id = $1',
+            [req.user.id]);
+        const u = r.rows[0] || {};
+        if (hasActivePass(u) || u.plan === 'pro' || coachAccess(u).unlimited) return next();
+        return res.status(402).json({
+            error: 'This premium template needs a Season Pass — free templates export clean, forever.',
+            code: 'PASS_REQUIRED', template: effective,
+        });
+    } catch (e) { console.error('[pdf-gate] failed (fail-open):', e.message); return next(); }
+}
+
 // Pro-only — used for downloads. Free users get a watermarked+blurred preview
 // on the client and are blocked here from producing a real file.
 async function requirePro(req, res, next) {
@@ -507,10 +587,15 @@ async function requirePro(req, res, next) {
     }
 }
 
-app.use('/generate-template',   requirePremiumAuth, enforceDailyQuota);
-app.use('/analyze-job-match',   requirePremiumAuth, enforceDailyQuota);
-app.use('/review-resume',       requirePremiumAuth, enforceDailyQuota);
-app.use('/generate-pdf',        requirePremiumAuth, requirePro);
+// v14 ladder: 1 credit per output-improving action; JD match stays free for
+// signed-in users (anonymous teaser arrives in Phase 5); PDF export is gated
+// by template, not plan. The old shared daily quota is retired.
+app.use('/generate-template',   requirePremiumAuth, requireCredits(1));
+app.use('/review-resume',       requirePremiumAuth, requireCredits(1));
+app.use('/improve-summary',     requirePremiumAuth, requireCredits(1));   // was reachable anonymously — closed
+app.use('/optimize-for-job',    requirePremiumAuth, requireCredits(1));   // was reachable anonymously — closed
+app.use('/analyze-job-match',   requirePremiumAuth);
+app.use('/generate-pdf',        requirePremiumAuth, requireTemplateEntitlement);
 
 // Payment endpoints - rate limited + session validated
 app.use('/create-order',        paymentLimiter);
@@ -1897,6 +1982,7 @@ app.get('/auth/google/callback', async (req, res) => {
             name: profile.name || profile.email.split('@')[0],
             provider: 'google', providerUserId: profile.sub,
             avatarUrl: profile.picture, anonClientId });
+        if (user.created) await grantSignupCredits(user.id);
         const token = signToken(user);
         const safeUser = { id:user.id, email:user.email, name:user.name, avatarUrl:user.avatar_url, plan:user.plan||'free' };
         // Store in polling map so LWC can pick it up
@@ -1952,6 +2038,7 @@ app.get('/auth/linkedin/callback', async (req, res) => {
 
         const user  = await upsertUser({ email, name: fullName, provider: 'linkedin',
             providerUserId: profile.sub, avatarUrl: profile.picture || null, anonClientId });
+        if (user.created) await grantSignupCredits(user.id);
         const token = signToken(user);
         console.log('[AUTH] LinkedIn login:', user.email);
         res.send(authSuccessPage(token, user));
@@ -2029,6 +2116,7 @@ app.get('/auth/magic-link/verify', async (req, res) => {
         const user  = await upsertUser({ email: link.email,
             name: link.email.split('@')[0], provider: 'email',
             providerUserId: null, avatarUrl: null, anonClientId: link.client_id });
+        if (user.created) await grantSignupCredits(user.id);
         const jwtToken = signToken(user);
         const safeUser = { id:user.id, email:user.email, name:user.name, avatarUrl:user.avatar_url, plan:user.plan||'free' };
         // Set unconditionally (not just if pre-registered) so a server restart
@@ -2052,10 +2140,21 @@ app.get('/auth/me', requireAuth, async (req, res) => {
         const r = await db.query('SELECT * FROM rn_users WHERE id=$1', [req.user.id]);
         if (!r.rows.length) return res.status(404).json({ error: 'User not found.' });
         const u = r.rows[0];
+        await expireStaleCredits(u.id);
+        const fresh = await db.query('SELECT credit_balance FROM rn_users WHERE id=$1', [u.id]).catch(() => null);
         res.json({ id:u.id, email:u.email, name:u.name, avatarUrl:u.avatar_url,
             plan:u.plan, resumeCount:u.resume_count, atsCount:u.ats_reports_count,
             createdAt:u.created_at, lastLoginAt:u.last_login_at,
-            coach: coachAccess(u) });   // { unlimited, passes, has } — one call refreshes everything
+            coach: coachAccess(u),
+            // v14 ladder — one call refreshes the whole entitlement surface
+            credits: fresh && fresh.rows.length ? fresh.rows[0].credit_balance : (u.credit_balance || 0),
+            passType: hasActivePass(u) ? u.pass_type : null,
+            passExpiresAt: hasActivePass(u) ? u.pass_expires_at : null,
+            passInterviewsRemaining: hasActivePass(u) ? (u.pass_interviews_remaining || 0) : 0,
+            interviewCredits: u.interview_credits || 0,
+            freeInterviewUsed: !!u.free_interview_used,
+            referralCode: u.referral_code || null,
+            grandfathered: !!u.grandfathered });
     } catch (e) { res.status(500).json({ error: 'Failed to load profile.' }); }
 });
 
@@ -2207,14 +2306,21 @@ If no food visible: {"error":"No food detected."}` }
 // ============================================================================
 
 const PLANS = {
-    pro_monthly:  { amount: 59900,  label: 'Pro Monthly',  currency: 'INR' },
-    pro_yearly:   { amount: 598800, label: 'Pro Yearly',   currency: 'INR' },
-    team_monthly: { amount: 179900, label: 'Team Monthly', currency: 'INR' },
-    team_yearly:  { amount: 1798800,label: 'Team Yearly',  currency: 'INR' },
-    // Interview Coach (INR equivalents of $19/mo · $13/mo-yearly · $7 session)
-    coach_unlimited:        { amount: 159900,  label: 'Coach Unlimited',        currency: 'INR', coach: 'unlimited' },
-    coach_unlimited_yearly: { amount: 1318800, label: 'Coach Unlimited (yr)',   currency: 'INR', coach: 'unlimited' },
-    session_pass:           { amount: 59900,   label: 'Coach Session Pass',     currency: 'INR', coach: 'pass' }
+    // ── v14 credit + pass ladder (one-time orders; amounts live HERE only) ──
+    boost_299:         { amount: 29900,  label: 'Boost Pack — 10 credits',      currency: 'INR', grant: 'boost' },
+    single_499:        { amount: 49900,  label: 'Single Interview',             currency: 'INR', grant: 'single' },
+    season_1499:       { amount: 149900, label: 'Season Pass — 90 days',        currency: 'INR', grant: 'season' },
+    pro_2999:          { amount: 299900, label: 'Placement Pro — 90 days',      currency: 'INR', grant: 'placement' },
+    report_unlock_299: { amount: 29900,  label: 'Full Report Unlock',           currency: 'INR', grant: 'report_unlock' },
+    // ── retired SKUs: no longer purchasable; kept so historical verify-payment
+    //    replays and refund lookups stay safe ──
+    pro_monthly:  { amount: 59900,  label: 'Pro Monthly',  currency: 'INR', retired: true },
+    pro_yearly:   { amount: 598800, label: 'Pro Yearly',   currency: 'INR', retired: true },
+    team_monthly: { amount: 179900, label: 'Team Monthly', currency: 'INR', retired: true },
+    team_yearly:  { amount: 1798800,label: 'Team Yearly',  currency: 'INR', retired: true },
+    coach_unlimited:        { amount: 159900,  label: 'Coach Unlimited',      currency: 'INR', coach: 'unlimited', retired: true },
+    coach_unlimited_yearly: { amount: 1318800, label: 'Coach Unlimited (yr)', currency: 'INR', coach: 'unlimited', retired: true },
+    session_pass:           { amount: 59900,   label: 'Coach Session Pass',   currency: 'INR', coach: 'pass', retired: true }
 };
 
 // POST /create-order
@@ -2227,6 +2333,30 @@ app.post('/create-order', async (req, res) => {
         if (!plan) {
             return res.status(400).json({ error: 'Invalid plan ID' });
         }
+        // Bridge: old SKUs stay purchasable until the Phase-3 ladder UI is live.
+        // Flip LADDER_LIVE=true on Railway when the new checkout deploys.
+        if (plan.retired && process.env.LADDER_LIVE === 'true') {
+            return res.status(400).json({ error: 'This plan is no longer available — see the new plans.' });
+        }
+        // report unlocks are bound to ONE owned, still-locked free session —
+        // reject up front so ₹299 can never be captured with nothing to grant
+        if (planId === 'report_unlock_299') {
+            let uid = null;
+            try {
+                const ah = req.headers['authorization'] || '';
+                const tk = ah.startsWith('Bearer ') ? ah.slice(7) : null;
+                if (tk) uid = jwt.verify(tk, JWT_SECRET).id;
+            } catch (e) {}
+            const sid = String(req.body.sessionId || '');
+            if (!uid) return res.status(401).json({ error: 'Sign in to unlock your report.', code: 'AUTH_REQUIRED' });
+            if (!UUID_RE.test(sid)) return res.status(400).json({ error: 'Missing interview session for this unlock.' });
+            if (db) {
+                const chk = await db.query(
+                    `SELECT id FROM rn_interview_sessions
+                     WHERE id=$1 AND user_id=$2 AND is_free_session=TRUE AND report_unlocked=FALSE`, [sid, uid]);
+                if (!chk.rows.length) return res.status(400).json({ error: 'That report is already unlocked (or the session was not found).' });
+            }
+        }
         if (plan.amount < 100) {
             return res.status(400).json({ error: 'Amount must be at least 100 paise' });
         }
@@ -2238,8 +2368,10 @@ app.post('/create-order', async (req, res) => {
             currency: plan.currency,
             receipt:  receipt,
             notes: {
-                plan:   planId,
-                userId: userId || 'guest'
+                plan:      planId,
+                userId:    userId || 'guest',
+                // report unlocks are bound to one interview session
+                sessionId: (planId === 'report_unlock_299' && req.body.sessionId && UUID_RE.test(String(req.body.sessionId))) ? String(req.body.sessionId) : ''
             }
         });
 
@@ -2341,7 +2473,67 @@ app.post('/verify-payment', async (req, res) => {
                     : new Date(Date.now() + 30  * 24 * 60 * 60 * 1000);
 
                 let rc = 0;
-                if (coach === 'unlimited') {
+                const v14 = plan.grant;   // v14 ladder grants take priority
+                // marker-first idempotency: every v14 grant writes one ledger row
+                // keyed by payment id (delta 0 for non-credit grants). If the row
+                // already exists, this is a retry of an ALREADY-applied grant —
+                // skip the side effect instead of doubling it.
+                let v14Fresh = true;
+                if (v14) {
+                    const mk = await db.query(
+                        `INSERT INTO rn_credit_ledger(user_id, delta, reason, ref_id, expires_at)
+                         VALUES($1, $2, $3, $4, $5)
+                         ON CONFLICT (ref_id) WHERE reason LIKE 'purchase:%' DO NOTHING`,
+                        [grantUserId,
+                         v14 === 'boost' ? 10 : 0,
+                         'purchase:' + v14,
+                         razorpay_payment_id,
+                         v14 === 'boost' ? new Date(Date.now() + 182 * 24 * 60 * 60 * 1000) : null]);
+                    v14Fresh = mk.rowCount > 0;
+                    if (!v14Fresh) console.warn(`[${SERVER_VERSION}] v14 grant retry detected for ${razorpay_payment_id} — side effects skipped`);
+                }
+                if (v14 === 'boost') {
+                    if (v14Fresh) {
+                        await db.query(`UPDATE rn_users SET credit_balance = credit_balance + 10, updated_at=NOW() WHERE id=$1`, [grantUserId]);
+                    }
+                    rc = 1;
+                    console.log(`[${SERVER_VERSION}] Boost Pack granted: +10 credits (fresh=${v14Fresh})`);
+                } else if (v14 === 'single') {
+                    if (v14Fresh) {
+                        const r = await db.query(`UPDATE rn_users SET interview_credits = interview_credits + 1, updated_at=NOW() WHERE id=$1`, [grantUserId]);
+                        rc = r.rowCount;
+                    } else rc = 1;
+                    // buying ANY interview product unlocks a previously locked free report
+                    await db.query(`UPDATE rn_interview_sessions SET report_unlocked=TRUE WHERE user_id=$1 AND is_free_session=TRUE`, [grantUserId]).catch(() => {});
+                    console.log(`[${SERVER_VERSION}] Single Interview granted (fresh=${v14Fresh})`);
+                } else if (v14 === 'season' || v14 === 'placement') {
+                    const passExp = new Date(Date.now() + 90 * 24 * 60 * 60 * 1000);
+                    const interviews = v14 === 'season' ? 6 : 25;
+                    const passType = v14 === 'season' ? 'season' : 'placement_pro';
+                    if (v14Fresh) {
+                        const r = await db.query(
+                            `UPDATE rn_users SET pass_type=$2, pass_expires_at=$3,
+                                    pass_interviews_remaining =
+                                        (CASE WHEN pass_expires_at IS NOT NULL AND pass_expires_at > NOW()
+                                              THEN GREATEST(pass_interviews_remaining, 0) ELSE 0 END) + $4,
+                                    updated_at=NOW() WHERE id=$1`,
+                            [grantUserId, passType, passExp, interviews]);
+                        rc = r.rowCount;
+                    } else rc = 1;
+                    // a pass unlocks the locked free report too
+                    await db.query(`UPDATE rn_interview_sessions SET report_unlocked=TRUE WHERE user_id=$1 AND is_free_session=TRUE`, [grantUserId]).catch(() => {});
+                    console.log(`[${SERVER_VERSION}] ${passType} granted until ${passExp.toISOString().slice(0,10)} (+${interviews} interviews, fresh=${v14Fresh})`);
+                } else if (v14 === 'report_unlock') {
+                    let sessionId = '';
+                    try { const ord = await razorpay.orders.fetch(razorpay_order_id); sessionId = (ord.notes && ord.notes.sessionId) || ''; } catch (e) {}
+                    if (sessionId && UUID_RE.test(sessionId)) {
+                        const r = await db.query(`UPDATE rn_interview_sessions SET report_unlocked=TRUE, updated_at=NOW() WHERE id=$1 AND user_id=$2`, [sessionId, grantUserId]);
+                        rc = r.rowCount;
+                        console.log(`[${SERVER_VERSION}] Report unlocked for session ${sessionId} (rows=${rc})`);
+                    } else {
+                        console.error(`[${SERVER_VERSION}] report_unlock without valid sessionId in order notes`);
+                    }
+                } else if (coach === 'unlimited') {
                     const r = await db.query(`UPDATE rn_users SET coach_plan='unlimited', coach_expires=$2, updated_at=NOW() WHERE id=$1`, [grantUserId, expiresAt]);
                     rc = r.rowCount;
                     console.log(`[${SERVER_VERSION}] Coach Unlimited granted (rows=${rc}) until ${expiresAt}`);
@@ -2425,7 +2617,9 @@ async function expireStaleCredits(userId) {
                 `SELECT COALESCE(SUM(-delta), 0)::int AS used FROM rn_credit_ledger
                  WHERE user_id=$1 AND delta < 0 AND created_at > $2`, [userId, grant.created_at]);
             const forfeit = Math.max(0, grant.delta - used.rows[0].used);
-            await db.query('UPDATE rn_credit_ledger SET expired_handled = TRUE WHERE id=$1', [grant.id]);
+            const claim = await db.query(
+                'UPDATE rn_credit_ledger SET expired_handled = TRUE WHERE id=$1 AND expired_handled = FALSE', [grant.id]);
+            if (!claim.rowCount) continue;   // a concurrent request already handled it
             if (forfeit > 0) {
                 await creditGrant(userId, -forfeit, 'expiry', grant.id);
                 console.log(`[credits] expired ${forfeit} for user ${userId} (grant ${grant.id})`);
@@ -2439,8 +2633,37 @@ function hasActivePass(u) {
     return !!(u && u.pass_type && u.pass_expires_at && new Date(u.pass_expires_at) > new Date());
 }
 
+// +2 credits on account creation — exactly once (flag-guarded, so safe even
+// if an auth flow retries). Pulled forward from Phase 5 so the credit economy
+// works from day one.
+async function grantSignupCredits(userId) {
+    try {
+        const r = await db.query(
+            `UPDATE rn_users SET signup_credits_granted = TRUE
+             WHERE id=$1 AND signup_credits_granted = FALSE`, [userId]);
+        if (r.rowCount) await creditGrant(userId, 2, 'signup');
+    } catch (e) { console.error('[credits] signup grant failed:', e.message); }
+}
+
 function makeReferralCode() {
     return crypto.randomBytes(5).toString('base64url').replace(/[^a-zA-Z0-9]/g, 'x').slice(0, 8).toUpperCase();
+}
+
+// Free first interview ships a PARTIAL report until unlocked (₹299 or a pass):
+// overall + verdict + ONE strength + ONE weakness. Enforced server-side —
+// the full report stays stored; only the response is trimmed.
+function partialReport(r) {
+    if (!r) return r;
+    return {
+        overall: r.overall, verdict: r.verdict, percentile: r.percentile,
+        strengths: (r.strengths || []).slice(0, 1),
+        weaknesses: (r.weaknesses || []).slice(0, 1),
+        dimensions: [], fixes: [], recommendations: [],
+        locked: true,
+    };
+}
+function reportIsLocked(row) {
+    return !!(row && row.is_free_session && !row.report_unlocked);
 }
 
 function coachAccess(u) {
@@ -2531,8 +2754,23 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 app.get('/coach/me', requireAuth, async (req, res) => {
     if (!db) return res.json({ unlimited: false, passes: 0, has: false });
     try {
-        const r = await db.query('SELECT coach_plan, coach_expires, session_passes FROM rn_users WHERE id=$1', [req.user.id]);
-        return res.json(coachAccess(r.rows[0] || {}));
+        const r = await db.query(
+            `SELECT coach_plan, coach_expires, session_passes, pass_type, pass_expires_at,
+                    pass_interviews_remaining, interview_credits, free_interview_used
+             FROM rn_users WHERE id=$1`, [req.user.id]);
+        const u = r.rows[0] || {};
+        const acc = coachAccess(u);
+        const passOk = hasActivePass(u) && (u.pass_interviews_remaining || 0) > 0;
+        return res.json({
+            unlimited: acc.unlimited,
+            passes: acc.passes,
+            passType: hasActivePass(u) ? u.pass_type : null,
+            passInterviewsRemaining: passOk ? u.pass_interviews_remaining : 0,
+            interviewCredits: u.interview_credits || 0,
+            freeInterviewAvailable: !u.free_interview_used,
+            // has = can start a PAID-grade interview right now (free path is separate)
+            has: acc.unlimited || acc.passes > 0 || passOk || (u.interview_credits || 0) > 0,
+        });
     } catch (e) { return res.status(500).json({ error: 'Failed to load Coach status.' }); }
 });
 
@@ -2544,14 +2782,40 @@ app.post('/coach/sessions', requireAuth, aiLimiter, async (req, res) => {
         if (!jobDescription || jobDescription.trim().length < 30) return res.status(400).json({ error: 'Add a job description (min 30 chars).' });
         if (jobDescription.length > 12000) return res.status(400).json({ error: 'Job description is too long — paste the relevant part (under 12,000 characters).' });
 
-        // Entitlement: Unlimited → allow; else a Session Pass is consumed — but only
-        // AFTER question generation succeeds, so an AI failure never burns a pass.
-        const ur = await db.query('SELECT coach_plan, coach_expires, session_passes FROM rn_users WHERE id=$1', [req.user.id]);
-        const acc = coachAccess(ur.rows[0] || {});
-        if (!acc.has) return res.status(402).json({ error: 'The Interview Coach is a premium feature. Choose a plan to start.', code: 'PRO_REQUIRED' });
+        // v14 entitlement ladder (consumed AFTER question generation succeeds, so
+        // an AI failure never burns anything; refunded if the insert fails):
+        //   legacy Unlimited (no consumption) → active pass interviews →
+        //   single-interview credits → legacy session passes → ONE free text interview.
+        const ur = await db.query(
+            `SELECT plan, coach_plan, coach_expires, session_passes, pass_type, pass_expires_at,
+                    pass_interviews_remaining, interview_credits, free_interview_used
+             FROM rn_users WHERE id=$1`, [req.user.id]);
+        const u = ur.rows[0] || {};
+        const wantAudio = mode !== 'text';
+        let source = null;
+        if (coachAccess(u).unlimited) source = 'legacy_unlimited';
+        else if (hasActivePass(u) && (u.pass_interviews_remaining || 0) > 0) source = 'pass';
+        else if ((u.interview_credits || 0) > 0) source = 'interview_credit';
+        else if ((u.session_passes || 0) > 0) source = 'legacy_pass';
+        // a paying pass-holder who used up their interviews gets the top-up
+        // upsell — never a silently degraded 'free' session
+        else if (!u.free_interview_used && !wantAudio && !hasActivePass(u)) source = 'free';
+        if (!source) {
+            const passExhausted = hasActivePass(u) && (u.pass_interviews_remaining || 0) <= 0;
+            return res.status(402).json({
+                error: passExhausted
+                    ? "You've used all the interviews in your pass — add a Single Interview (₹499) to keep going."
+                    : wantAudio && !u.free_interview_used
+                        ? 'Audio interviews need a Single Interview (₹499) or a Season Pass — your first TEXT interview is free.'
+                        : "You've used your free interview. Get a Single Interview (₹499), or 6 complete interviews with the Season Pass (₹1,499).",
+                code: 'INTERVIEW_REQUIRED',
+                freeAvailable: !u.free_interview_used && !hasActivePass(u),
+            });
+        }
+        const isFreeSession = source === 'free';
 
         const type  = COACH_TYPES.includes(interviewType) ? interviewType : 'Behavioral';
-        const count = [5, 6, 10].includes(length) ? length : 6;
+        const count = isFreeSession ? 5 : ([5, 6, 10].includes(length) ? length : 6);
         const diffN = parseInt(difficulty, 10);
         const diff  = Math.max(0, Math.min(100, Number.isFinite(diffN) ? diffN : 60));
         const resumeString = serializeResumeData(resumeData);
@@ -2577,23 +2841,35 @@ app.post('/coach/sessions', requireAuth, aiLimiter, async (req, res) => {
         }
         if (!questions.length) return res.status(502).json({ error: 'Could not generate questions. Please try again.' });
 
-        if (!acc.unlimited) {
-            const dec = await db.query('UPDATE rn_users SET session_passes = session_passes - 1 WHERE id=$1 AND session_passes > 0', [req.user.id]);
-            if (!dec.rowCount) return res.status(402).json({ error: 'No session passes left.', code: 'PRO_REQUIRED' });
+        // consume the entitlement (atomic; race-lost → honest 402)
+        const CONSUME = {
+            pass:             "UPDATE rn_users SET pass_interviews_remaining = pass_interviews_remaining - 1, updated_at=NOW() WHERE id=$1 AND pass_interviews_remaining > 0",
+            interview_credit: "UPDATE rn_users SET interview_credits = interview_credits - 1, updated_at=NOW() WHERE id=$1 AND interview_credits > 0",
+            legacy_pass:      "UPDATE rn_users SET session_passes = session_passes - 1, updated_at=NOW() WHERE id=$1 AND session_passes > 0",
+            free:             "UPDATE rn_users SET free_interview_used = TRUE, updated_at=NOW() WHERE id=$1 AND free_interview_used = FALSE",
+        };
+        if (CONSUME[source]) {
+            const dec = await db.query(CONSUME[source], [req.user.id]);
+            if (!dec.rowCount) return res.status(402).json({ error: 'That entitlement was just used up — refresh and try again.', code: 'INTERVIEW_REQUIRED' });
         }
 
         let ins;
         try {
             ins = await db.query(
-                `INSERT INTO rn_interview_sessions(user_id,company,job_title,job_description,interview_type,difficulty,mode,resume_snapshot,questions,status)
-                 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'in_progress') RETURNING id, questions`,
-                [req.user.id, String(company || '').slice(0, 255), String(jobTitle || '').slice(0, 255), jobDescription, type, diff, mode === 'text' ? 'text' : 'voice', resumeData || null, JSON.stringify(questions)]
+                `INSERT INTO rn_interview_sessions(user_id,company,job_title,job_description,interview_type,difficulty,mode,resume_snapshot,questions,status,is_free_session,report_unlocked)
+                 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'in_progress',$10,$11) RETURNING id, questions`,
+                [req.user.id, String(company || '').slice(0, 255), String(jobTitle || '').slice(0, 255), jobDescription, type, diff, mode === 'text' ? 'text' : 'voice', resumeData || null, JSON.stringify(questions),
+                 isFreeSession, !isFreeSession]
             );
         } catch (insErr) {
-            // refund the pass we just consumed — the user got nothing
-            if (!acc.unlimited) {
-                await db.query('UPDATE rn_users SET session_passes = session_passes + 1 WHERE id=$1', [req.user.id]).catch(() => {});
-            }
+            // refund whatever we just consumed — the user got nothing
+            const REFUND = {
+                pass:             "UPDATE rn_users SET pass_interviews_remaining = pass_interviews_remaining + 1 WHERE id=$1",
+                interview_credit: "UPDATE rn_users SET interview_credits = interview_credits + 1 WHERE id=$1",
+                legacy_pass:      "UPDATE rn_users SET session_passes = session_passes + 1 WHERE id=$1",
+                free:             "UPDATE rn_users SET free_interview_used = FALSE WHERE id=$1",
+            };
+            if (REFUND[source]) await db.query(REFUND[source], [req.user.id]).catch(() => {});
             throw insErr;
         }
         console.log(`[${SERVER_VERSION}] [coach] session ${ins.rows[0].id} created (${type}, ${count}Q, ${mode})`);
@@ -2622,7 +2898,11 @@ app.get('/coach/sessions/:id', requireAuth, async (req, res) => {
     try {
         const r = await db.query('SELECT * FROM rn_interview_sessions WHERE id=$1 AND user_id=$2', [req.params.id, req.user.id]);
         if (!r.rows.length) return res.status(404).json({ error: 'Session not found.' });
-        res.json(r.rows[0]);
+        const row = r.rows[0];
+        if (reportIsLocked(row) && row.report) {
+            return res.json({ ...row, report: partialReport(row.report), report_locked: true });
+        }
+        res.json(row);
     } catch (e) { res.status(500).json({ error: 'Failed to load session.' }); }
 });
 
@@ -2656,7 +2936,7 @@ app.post('/coach/sessions/:id/score', requireAuth, aiLimiter, async (req, res) =
         const r = await db.query('SELECT * FROM rn_interview_sessions WHERE id=$1 AND user_id=$2', [req.params.id, req.user.id]);
         if (!r.rows.length) return res.status(404).json({ error: 'Session not found.' });
         const s = r.rows[0];
-        if (s.report) return res.json({ report: s.report, overall: s.overall_score }); // idempotent
+        if (s.report) return res.json({ report: reportIsLocked(s) ? partialReport(s.report) : s.report, overall: s.overall_score, locked: reportIsLocked(s) }); // idempotent
 
         const questions = Array.isArray(s.questions) ? s.questions : [];
         const answers   = Array.isArray(s.answers) ? s.answers : [];
@@ -2686,10 +2966,10 @@ app.post('/coach/sessions/:id/score', requireAuth, aiLimiter, async (req, res) =
         );
         if (!upd.rowCount) {
             const re = await db.query('SELECT report, overall_score FROM rn_interview_sessions WHERE id=$1', [s.id]);
-            return res.json({ report: re.rows[0].report, overall: re.rows[0].overall_score });
+            return res.json({ report: reportIsLocked(s) ? partialReport(re.rows[0].report) : re.rows[0].report, overall: re.rows[0].overall_score, locked: reportIsLocked(s) });
         }
         console.log(`[${SERVER_VERSION}] [coach] session ${s.id} scored → ${report.overall}`);
-        res.json({ report, overall: report.overall });
+        res.json({ report: reportIsLocked(s) ? partialReport(report) : report, overall: report.overall, locked: reportIsLocked(s) });
     } catch (e) {
         console.error('[coach] score error:', e.message);
         res.status(500).json({ error: 'Failed to generate report.' });
