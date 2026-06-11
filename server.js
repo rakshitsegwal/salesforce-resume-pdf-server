@@ -74,7 +74,7 @@ app.use(
 );
 
 // --- Version marker ---------------------------------------------------------
-const SERVER_VERSION = 'v11.5-coach-2026';
+const SERVER_VERSION = 'v11.6-coach-2026';
 const BOOT_TIME      = Date.now();
 
 // --- Auth config ------------------------------------------------------------
@@ -245,7 +245,7 @@ const magicLinkLimiter = rateLimit({
 // Auth polling - light limit to prevent nonce enumeration
 const pollLimiter = rateLimit({
     windowMs: 5 * 60 * 1000,
-    max: 60,                     // 60 polls per 5 min (polling every 1.5s for up to 5 min = ~200 max)
+    max: 250,                    // Google polls every 1.5s (~200/5min) + magic-link every 6s — both must fit
     message: { error: 'Too many poll requests.' }
 });
 
@@ -2166,6 +2166,7 @@ app.post('/verify-payment', async (req, res) => {
 
         // Replay protection: a payment id grants exactly once. ON CONFLICT no-op
         // → if it was already redeemed, acknowledge success without re-granting.
+        let redeemed = false;
         if (db) {
             try {
                 const ins = await db.query(
@@ -2173,7 +2174,8 @@ app.post('/verify-payment', async (req, res) => {
                      VALUES($1,$2,$3,$4) ON CONFLICT (payment_id) DO NOTHING`,
                     [razorpay_payment_id, razorpay_order_id, effectivePlanId, grantUserId || null]
                 );
-                if (!ins.rowCount) {
+                redeemed = ins.rowCount > 0;
+                if (!redeemed) {
                     console.warn(`[${SERVER_VERSION}] Replay blocked: payment ${razorpay_payment_id} already redeemed`);
                     return res.json({ success: true, payment_id: razorpay_payment_id, order_id: razorpay_order_id, plan: effectivePlanId, replay: true });
                 }
@@ -2212,6 +2214,13 @@ app.post('/verify-payment', async (req, res) => {
         } else {
             grantInfo.error = 'no-grant-user-or-db';
             console.error(`[${SERVER_VERSION}] NO grantUserId — entitlement NOT saved (body userId=${userId})`);
+        }
+
+        // If the grant didn't land, release the redemption so a retry of
+        // verify-payment can grant — otherwise the payment is stranded forever.
+        if (redeemed && db && (grantInfo.error || grantInfo.rows === 0)) {
+            await db.query('DELETE FROM rn_payments WHERE payment_id=$1', [razorpay_payment_id]).catch(() => {});
+            console.warn(`[${SERVER_VERSION}] redemption released for ${razorpay_payment_id} (grant did not land)`);
         }
 
         res.json({
@@ -2298,8 +2307,10 @@ Give 3 strengths, 3 weaknesses, the 2 weakest answers as fixes, and 3 recommenda
 }
 
 // All /coach endpoints share the API secret + require a signed-in user.
-// aiLimiter caps OpenAI spend per IP — coach create/score both hit the model.
-app.use('/coach', validateApiSecret, aiLimiter);
+// Only create + score hit OpenAI — aiLimiter goes on those two routes alone.
+// A blanket limiter here would 429 paying users mid-interview (10+ answer
+// saves per session are plain DB writes).
+app.use('/coach', validateApiSecret);
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -2313,7 +2324,7 @@ app.get('/coach/me', requireAuth, async (req, res) => {
 });
 
 // Create a session (consumes entitlement) and generate the questions.
-app.post('/coach/sessions', requireAuth, async (req, res) => {
+app.post('/coach/sessions', requireAuth, aiLimiter, async (req, res) => {
     if (!db) return res.status(503).json({ error: 'Coach not configured.' });
     try {
         const { resumeData, company, jobTitle, jobDescription, interviewType, difficulty, mode, length } = req.body;
@@ -2413,7 +2424,7 @@ app.post('/coach/sessions/:id/answers', requireAuth, async (req, res) => {
 });
 
 // Generate the scored report.
-app.post('/coach/sessions/:id/score', requireAuth, async (req, res) => {
+app.post('/coach/sessions/:id/score', requireAuth, aiLimiter, async (req, res) => {
     if (!db) return res.status(503).json({ error: 'Coach not configured.' });
     if (!UUID_RE.test(req.params.id)) return res.status(404).json({ error: 'Session not found.' });
     try {
