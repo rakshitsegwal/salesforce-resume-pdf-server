@@ -76,7 +76,7 @@ app.use(
 );
 
 // --- Version marker ---------------------------------------------------------
-const SERVER_VERSION = 'v14.3-credits-2026';
+const SERVER_VERSION = 'v14.4-credits-2026';
 const BOOT_TIME      = Date.now();
 
 // --- Auth config ------------------------------------------------------------
@@ -2160,6 +2160,15 @@ app.get('/auth/me', requireAuth, async (req, res) => {
         const r = await db.query('SELECT * FROM rn_users WHERE id=$1', [req.user.id]);
         if (!r.rows.length) return res.status(404).json({ error: 'User not found.' });
         const u = r.rows[0];
+        if (!u.referral_code) {   // pre-v14 account — mint a code on first profile load
+            for (let i = 0; i < 3; i++) {
+                try {
+                    const code = makeReferralCode();
+                    await db.query('UPDATE rn_users SET referral_code=$2 WHERE id=$1 AND referral_code IS NULL', [u.id, code]);
+                    u.referral_code = code; break;
+                } catch (e) { /* unique collision — retry with a fresh code */ }
+            }
+        }
         await expireStaleCredits(u.id);
         const fresh = await db.query('SELECT credit_balance FROM rn_users WHERE id=$1', [u.id]).catch(() => null);
         res.json({ id:u.id, email:u.email, name:u.name, avatarUrl:u.avatar_url,
@@ -2611,8 +2620,8 @@ const COACH_TYPES = ['Behavioral', 'Technical', 'Mixed', 'System design', 'Case'
 // ── Credits + passes (v14 monetization) ─────────────────────────────────────
 // One grant/debit = one ledger row + the cached balance updated in the same
 // statement. Debits happen in requireCredits (Phase 2); grants here.
-async function creditGrant(userId, delta, reason, refId = null, expiresAt = null) {
-    await db.query(
+async function creditGrant(userId, delta, reason, refId = null, expiresAt = null, q = null) {
+    await (q || db).query(
         `WITH ins AS (
             INSERT INTO rn_credit_ledger(user_id, delta, reason, ref_id, expires_at)
             VALUES($1,$2,$3,$4,$5)
@@ -3066,6 +3075,52 @@ app.post('/coach/sessions/:id/transcribe', requireAuth, coachMediaLimiter,
     }
 });
 
+
+// ============================================================================
+// REFERRALS — give 5 credits, get 5 credits (v14 growth loop)
+// ============================================================================
+// The code travels via renonym.com/?ref=CODE → localStorage → claimed once
+// after sign-in. referred_by acts as the once-only guard (atomic).
+app.use('/referral', validateApiSecret);
+app.use('/referral', rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 20,                     // a human claims once; blocks code enumeration
+    message: { error: 'Too many attempts — try again later.' }
+}));
+
+app.post('/referral/claim', requireAuth, async (req, res) => {
+    if (!db) return res.status(503).json({ error: 'Referrals not configured.' });
+    try {
+        const code = String((req.body && req.body.code) || '').trim().toUpperCase().slice(0, 16);
+        if (!code) return res.status(400).json({ error: 'Missing referral code.' });
+        const ref = await db.query('SELECT id FROM rn_users WHERE referral_code=$1', [code]);
+        if (!ref.rows.length) return res.status(404).json({ error: 'Unknown referral code.' });
+        const referrerId = ref.rows[0].id;
+        if (referrerId === req.user.id) return res.status(400).json({ error: "You can't refer yourself — share the link instead!" });
+
+        // atomic once-only: first claim wins, repeats are no-ops. The claim and
+        // both grants commit together — a crash can't consume the claim unpaid.
+        const client = await db.connect();
+        try {
+            await client.query('BEGIN');
+            const claim = await client.query(
+                'UPDATE rn_users SET referred_by=$2, updated_at=NOW() WHERE id=$1 AND referred_by IS NULL',
+                [req.user.id, referrerId]);
+            if (!claim.rowCount) { await client.query('ROLLBACK'); return res.json({ ok: true, already: true }); }
+            await creditGrant(req.user.id, 5, 'referral:received', code, null, client);
+            await creditGrant(referrerId, 5, 'referral:given', req.user.id, null, client);
+            await client.query('COMMIT');
+        } catch (e) {
+            await client.query('ROLLBACK').catch(() => {});
+            throw e;
+        } finally { client.release(); }
+        console.log(`[${SERVER_VERSION}] referral claimed: ${code} → +5/+5`);
+        res.json({ ok: true, granted: 5 });
+    } catch (e) {
+        console.error('[referral] claim error:', e.message);
+        res.status(500).json({ error: 'Could not apply the referral.' });
+    }
+});
 
 // ============================================================================
 // APPLICATION TRACKER — job-search CRM (jobs + uniform event timeline)
