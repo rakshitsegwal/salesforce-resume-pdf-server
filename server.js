@@ -76,7 +76,7 @@ app.use(
 );
 
 // --- Version marker ---------------------------------------------------------
-const SERVER_VERSION = 'v13.2-tracker-2026';
+const SERVER_VERSION = 'v14.0-credits-2026';
 const BOOT_TIME      = Date.now();
 
 // --- Auth config ------------------------------------------------------------
@@ -232,6 +232,43 @@ if (process.env.DATABASE_URL) {
         );
         CREATE INDEX IF NOT EXISTS idx_rn_job_events_job ON rn_job_events(job_id, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_rn_job_events_due ON rn_job_events(user_id, done, due_at);
+
+        -- ── Monetization: prepaid credits + pass ladder (v14) ───────────
+        -- Credits are a LEDGER (auditable grants/debits) + a cached balance.
+        -- Passes (season / placement_pro) bypass credit checks while active.
+        ALTER TABLE rn_users ADD COLUMN IF NOT EXISTS credit_balance            INTEGER     DEFAULT 0;
+        ALTER TABLE rn_users ADD COLUMN IF NOT EXISTS pass_type                 VARCHAR(20);
+        ALTER TABLE rn_users ADD COLUMN IF NOT EXISTS pass_expires_at           TIMESTAMPTZ;
+        ALTER TABLE rn_users ADD COLUMN IF NOT EXISTS pass_interviews_remaining INTEGER     DEFAULT 0;
+        ALTER TABLE rn_users ADD COLUMN IF NOT EXISTS interview_credits         INTEGER     DEFAULT 0;
+        ALTER TABLE rn_users ADD COLUMN IF NOT EXISTS free_interview_used       BOOLEAN     DEFAULT FALSE;
+        ALTER TABLE rn_users ADD COLUMN IF NOT EXISTS signup_credits_granted    BOOLEAN     DEFAULT FALSE;
+        ALTER TABLE rn_users ADD COLUMN IF NOT EXISTS grandfathered             BOOLEAN     DEFAULT FALSE;
+        ALTER TABLE rn_users ADD COLUMN IF NOT EXISTS referral_code             VARCHAR(16) UNIQUE;
+        ALTER TABLE rn_users ADD COLUMN IF NOT EXISTS referred_by               UUID;
+        ALTER TABLE rn_users ADD COLUMN IF NOT EXISTS idle_nudge_sent_at        TIMESTAMPTZ;
+        CREATE TABLE IF NOT EXISTS rn_credit_ledger (
+            id              UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+            user_id         UUID        NOT NULL REFERENCES rn_users(id) ON DELETE CASCADE,
+            delta           INTEGER     NOT NULL,
+            reason          VARCHAR(50) NOT NULL,
+            ref_id          VARCHAR(100),
+            expires_at      TIMESTAMPTZ,            -- boost-pack grants expire (6 months)
+            expired_handled BOOLEAN     DEFAULT FALSE,
+            created_at      TIMESTAMPTZ DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_rn_credit_ledger_user ON rn_credit_ledger(user_id, created_at DESC);
+        -- Free first interview produces a PARTIAL report until unlocked.
+        ALTER TABLE rn_interview_sessions ADD COLUMN IF NOT EXISTS is_free_session BOOLEAN DEFAULT FALSE;
+        ALTER TABLE rn_interview_sessions ADD COLUMN IF NOT EXISTS report_unlocked BOOLEAN DEFAULT TRUE;
+        -- JD corpus for future programmatic SEO (fire-and-forget writes only).
+        CREATE TABLE IF NOT EXISTS rn_jd_corpus (
+            id         UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+            user_hash  VARCHAR(64),
+            raw_text   TEXT,
+            tags       JSONB,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        );
     `)
     .then(() => console.log('[DB] Schema ready'))
     .catch(e => console.error('[DB] Schema init:', e.message));
@@ -1781,11 +1818,11 @@ async function upsertUser({ email, name, provider, providerUserId, avatarUrl, an
         return { ...u, name: name || u.name, avatar_url: avatarUrl || u.avatar_url };
     }
     const r = await db.query(
-        `INSERT INTO rn_users(email,name,provider,provider_user_id,avatar_url,anonymous_client_id)
-         VALUES($1,$2,$3,$4,$5,$6) RETURNING *`,
-        [email, name, provider, providerUserId || null, avatarUrl || null, anonClientId || null]
+        `INSERT INTO rn_users(email,name,provider,provider_user_id,avatar_url,anonymous_client_id,referral_code)
+         VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+        [email, name, provider, providerUserId || null, avatarUrl || null, anonClientId || null, makeReferralCode()]
     );
-    return r.rows[0];
+    return { ...r.rows[0], created: true };   // brand-new account — Phase 5 signup grant keys off this
 }
 
 // Returns HTML page rendered inside the OAuth popup that posts the token back
@@ -2358,6 +2395,53 @@ app.post('/verify-payment', async (req, res) => {
 // a Session Pass) — consumed on start. Sessions are owned per-user.
 
 const COACH_TYPES = ['Behavioral', 'Technical', 'Mixed', 'System design', 'Case'];
+
+// ── Credits + passes (v14 monetization) ─────────────────────────────────────
+// One grant/debit = one ledger row + the cached balance updated in the same
+// statement. Debits happen in requireCredits (Phase 2); grants here.
+async function creditGrant(userId, delta, reason, refId = null, expiresAt = null) {
+    await db.query(
+        `WITH ins AS (
+            INSERT INTO rn_credit_ledger(user_id, delta, reason, ref_id, expires_at)
+            VALUES($1,$2,$3,$4,$5)
+        )
+        UPDATE rn_users SET credit_balance = GREATEST(0, credit_balance + $2), updated_at = NOW()
+        WHERE id = $1`,
+        [userId, delta, reason, refId, expiresAt]
+    );
+}
+
+// Lazy expiry for boost-pack grants: debits made AFTER a grant are assumed to
+// consume that grant first (user-favourable, fully auditable via the ledger);
+// whatever remains of an expired grant is forfeited with a compensating entry.
+async function expireStaleCredits(userId) {
+    try {
+        const g = await db.query(
+            `SELECT id, delta, created_at FROM rn_credit_ledger
+             WHERE user_id=$1 AND delta > 0 AND expires_at IS NOT NULL
+               AND expires_at < NOW() AND expired_handled = FALSE`, [userId]);
+        for (const grant of g.rows) {
+            const used = await db.query(
+                `SELECT COALESCE(SUM(-delta), 0)::int AS used FROM rn_credit_ledger
+                 WHERE user_id=$1 AND delta < 0 AND created_at > $2`, [userId, grant.created_at]);
+            const forfeit = Math.max(0, grant.delta - used.rows[0].used);
+            await db.query('UPDATE rn_credit_ledger SET expired_handled = TRUE WHERE id=$1', [grant.id]);
+            if (forfeit > 0) {
+                await creditGrant(userId, -forfeit, 'expiry', grant.id);
+                console.log(`[credits] expired ${forfeit} for user ${userId} (grant ${grant.id})`);
+            }
+        }
+    } catch (e) { console.error('[credits] expiry sweep failed:', e.message); }
+}
+
+// Active pass = unlimited AI actions (credit checks bypassed entirely).
+function hasActivePass(u) {
+    return !!(u && u.pass_type && u.pass_expires_at && new Date(u.pass_expires_at) > new Date());
+}
+
+function makeReferralCode() {
+    return crypto.randomBytes(5).toString('base64url').replace(/[^a-zA-Z0-9]/g, 'x').slice(0, 8).toUpperCase();
+}
 
 function coachAccess(u) {
     const unlimited = u && u.coach_plan === 'unlimited' &&
