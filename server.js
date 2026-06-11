@@ -61,7 +61,7 @@ app.use((req, res, next) => {
 // Extend server response timeout to 120s - inspiration flow makes 2 OpenAI calls
 app.use((req, res, next) => {
     res.setTimeout(120000, () => {
-        res.status(503).json({ error: 'Request timed out. Please try again.' });
+        if (!res.headersSent) res.status(503).json({ error: 'Request timed out. Please try again.' });
     });
     next();
 });
@@ -74,7 +74,7 @@ app.use(
 );
 
 // --- Version marker ---------------------------------------------------------
-const SERVER_VERSION = 'v11.4-coach-2026';
+const SERVER_VERSION = 'v11.5-coach-2026';
 const BOOT_TIME      = Date.now();
 
 // --- Auth config ------------------------------------------------------------
@@ -89,6 +89,7 @@ const LINKEDIN_SEC   = process.env.LINKEDIN_CLIENT_SECRET || '';
 
 // --- PostgreSQL pool --------------------------------------------------------
 let db = null;
+let schemaReady = Promise.resolve();   // app.listen waits for schema init
 if (process.env.DATABASE_URL) {
     db = new Pool({
         connectionString: process.env.DATABASE_URL,
@@ -97,7 +98,7 @@ if (process.env.DATABASE_URL) {
         idleTimeoutMillis: 30000,
         connectionTimeoutMillis: 5000
     });
-    db.query(`
+    schemaReady = db.query(`
         CREATE EXTENSION IF NOT EXISTS pgcrypto;
         CREATE TABLE IF NOT EXISTS rn_users (
             id                  UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -179,6 +180,14 @@ if (process.env.DATABASE_URL) {
             completed_at    TIMESTAMPTZ
         );
         CREATE INDEX IF NOT EXISTS idx_rn_sessions_user ON rn_interview_sessions(user_id, created_at DESC);
+        -- Replay protection: each Razorpay payment grants exactly once.
+        CREATE TABLE IF NOT EXISTS rn_payments (
+            payment_id VARCHAR(64)  PRIMARY KEY,
+            order_id   VARCHAR(64),
+            plan_id    VARCHAR(50),
+            user_id    UUID,
+            created_at TIMESTAMPTZ  DEFAULT NOW()
+        );
     `)
     .then(() => console.log('[DB] Schema ready'))
     .catch(e => console.error('[DB] Schema init:', e.message));
@@ -368,7 +377,7 @@ async function enforceDailyQuota(req, res, next) {
 
         if (!isPro) {
             res.on('finish', () => {
-                if (res.statusCode >= 200 && res.statusCode < 300) {
+                if (res.statusCode >= 200 && res.statusCode < 300 && !res.locals.aiFallback) {
                     db.query(
                         `UPDATE rn_users SET
                             daily_premium_count = CASE WHEN daily_premium_date = CURRENT_DATE THEN daily_premium_count + 1 ELSE 1 END,
@@ -692,10 +701,11 @@ app.post('/generate-pdf', async (req, res) => {
         cssLen:  req.body?.css?.length
     });
 
+    let browser = null;   // closed in finally — error paths must not leak Chromium
     try {
         const { html, css } = req.body;
 
-        const browser = await puppeteer.launch({
+        browser = await puppeteer.launch({
             headless: true,
             args: [
                 '--no-sandbox',
@@ -801,8 +811,6 @@ app.post('/generate-pdf', async (req, res) => {
             margin: { top: '0', right: '0', bottom: '0', left: '0' }
         });
 
-        await browser.close();
-
         res.set({
             'Content-Type':    'application/pdf',
             'Content-Length':   pdf.length,
@@ -812,7 +820,9 @@ app.post('/generate-pdf', async (req, res) => {
 
     } catch (e) {
         console.error('PDF generation error:', e);
-        res.status(500).send('PDF generation failed');
+        if (!res.headersSent) res.status(500).send('PDF generation failed');
+    } finally {
+        if (browser) await browser.close().catch(() => {});
     }
 });
 
@@ -1212,6 +1222,7 @@ Return the design tokens as JSON only.`;
             // Graceful degradation - never fail the theming path on an AI hiccup
             console.warn(`[${SERVER_VERSION}] Token generation failed (using defaults):`, aiErr.message);
             tokens = { ...DEFAULT_TOKENS };
+            res.locals.aiFallback = true;   // don't charge quota for a default theme
         }
 
         console.log(`[${SERVER_VERSION}] /generate-template -> layout=${detectedLayout} accent=${tokens.accent}`);
@@ -1220,6 +1231,7 @@ Return the design tokens as JSON only.`;
     } catch (e) {
         console.error('Template generation error:', e);
         // Even on an unexpected error, hand back a usable theme rather than 500
+        res.locals.aiFallback = true;
         res.json({ tokens: { ...DEFAULT_TOKENS }, layout: 'two-col' });
     }
 });
@@ -1638,9 +1650,9 @@ function signToken(user) {
 function requireAuth(req, res, next) {
     const header = req.headers['authorization'] || '';
     const token  = header.startsWith('Bearer ') ? header.slice(7) : null;
-    if (!token) return res.status(401).json({ error: 'Authentication required.' });
+    if (!token) return res.status(401).json({ error: 'Authentication required.', code: 'AUTH_REQUIRED' });
     try { req.user = jwt.verify(token, JWT_SECRET); next(); }
-    catch (_) { res.status(401).json({ error: 'Session expired. Please log in again.' }); }
+    catch (_) { res.status(401).json({ error: 'Session expired. Please log in again.', code: 'AUTH_REQUIRED' }); }
 }
 
 async function upsertUser({ email, name, provider, providerUserId, avatarUrl, anonClientId }) {
@@ -1809,7 +1821,7 @@ app.post('/auth/magic-link/request', async (req, res) => {
     if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
         return res.status(400).json({ error: 'Please enter a valid email address.' });
     if (!mailer)
-        return res.status(503).json({ error: 'Email not configured on server. Use Google or LinkedIn.' });
+        return res.status(503).json({ error: 'Email not configured on server. Use Google sign-in instead.' });
     try {
         const rawToken  = crypto.randomBytes(32).toString('hex');
         const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
@@ -1818,6 +1830,15 @@ app.post('/auth/magic-link/request', async (req, res) => {
             'INSERT INTO rn_magic_tokens(email,token,expires_at,client_id) VALUES($1,$2,$3,$4)',
             [email, rawToken, expiresAt, clientId || null]
         );
+        // Register the polling slot so the SPA can pick up the session after the
+        // user clicks the email link (popup/opener can't be relied on from mail apps).
+        if (clientId) {
+            pendingAuthSessions.set(clientId + '_ml', null);
+            setTimeout(() => {
+                const v = pendingAuthSessions.get(clientId + '_ml');
+                if (v === null) pendingAuthSessions.delete(clientId + '_ml');
+            }, 15 * 60 * 1000);
+        }
         const link = `${APP_URL}/auth/magic-link/verify?token=${rawToken}`;
         await mailer.sendMail({
             from: process.env.SMTP_FROM || 'noreply@renonym.ai',
@@ -1862,7 +1883,9 @@ app.get('/auth/magic-link/verify', async (req, res) => {
             providerUserId: null, avatarUrl: null, anonClientId: link.client_id });
         const jwtToken = signToken(user);
         const safeUser = { id:user.id, email:user.email, name:user.name, avatarUrl:user.avatar_url, plan:user.plan||'free' };
-        if (link.client_id && pendingAuthSessions.has(link.client_id + '_ml')) {
+        // Set unconditionally (not just if pre-registered) so a server restart
+        // between request and click doesn't strand the sign-in.
+        if (link.client_id) {
             pendingAuthSessions.set(link.client_id + '_ml', { token: jwtToken, user: safeUser, createdAt: Date.now() });
         }
         console.log('[AUTH] Magic link login:', user.email);
@@ -2111,9 +2134,22 @@ app.post('/verify-payment', async (req, res) => {
             return res.status(400).json({ error: 'Invalid payment signature' });
         }
 
-        // Signature valid - upgrade user plan if authenticated
-        const plan = PLANS[planId];
-        console.log(`[${SERVER_VERSION}] Payment verified: order=${razorpay_order_id} payment=${razorpay_payment_id} plan=${planId}`);
+        // The plan is derived from the ORDER (created server-side with the real
+        // amount), never from the client body — a ₹599 payment can't claim
+        // coach_unlimited by sending a different planId.
+        let effectivePlanId = planId;
+        try {
+            const order = await razorpay.orders.fetch(razorpay_order_id);
+            if (order && order.notes && order.notes.plan && PLANS[order.notes.plan]) {
+                effectivePlanId = order.notes.plan;
+                if (planId && planId !== effectivePlanId) {
+                    console.warn(`[${SERVER_VERSION}] planId mismatch: body=${planId} order=${effectivePlanId} — using order`);
+                }
+            }
+        } catch (e) { console.error(`[${SERVER_VERSION}] order fetch failed (using body planId):`, e.message); }
+        const plan = PLANS[effectivePlanId];
+        if (!plan) return res.status(400).json({ error: 'Unknown plan for this payment.' });
+        console.log(`[${SERVER_VERSION}] Payment verified: order=${razorpay_order_id} payment=${razorpay_payment_id} plan=${effectivePlanId}`);
 
         // Resolve the user to grant to. Prefer the signed-in JWT (always sent by
         // the client) over the body userId, which can be missing/stale — that was
@@ -2125,15 +2161,31 @@ app.post('/verify-payment', async (req, res) => {
             if (tk) grantUserId = jwt.verify(tk, JWT_SECRET).id;
         } catch (e) { /* ignore bad/expired token */ }
         if (!grantUserId) grantUserId = userId;
-        const coach = plan && plan.coach; // 'unlimited' | 'pass' | undefined
-        console.log(`[${SERVER_VERSION}] grant → user=${grantUserId} plan=${planId} coach=${coach || 'none'}`);
+        const coach = plan.coach; // 'unlimited' | 'pass' | undefined
+        console.log(`[${SERVER_VERSION}] grant → user=${grantUserId} plan=${effectivePlanId} coach=${coach || 'none'}`);
+
+        // Replay protection: a payment id grants exactly once. ON CONFLICT no-op
+        // → if it was already redeemed, acknowledge success without re-granting.
+        if (db) {
+            try {
+                const ins = await db.query(
+                    `INSERT INTO rn_payments(payment_id, order_id, plan_id, user_id)
+                     VALUES($1,$2,$3,$4) ON CONFLICT (payment_id) DO NOTHING`,
+                    [razorpay_payment_id, razorpay_order_id, effectivePlanId, grantUserId || null]
+                );
+                if (!ins.rowCount) {
+                    console.warn(`[${SERVER_VERSION}] Replay blocked: payment ${razorpay_payment_id} already redeemed`);
+                    return res.json({ success: true, payment_id: razorpay_payment_id, order_id: razorpay_order_id, plan: effectivePlanId, replay: true });
+                }
+            } catch (e) { console.error(`[${SERVER_VERSION}] replay-check failed (continuing):`, e.message); }
+        }
 
         // Grant outcome is echoed in the response (debug) so the client can show
         // exactly what happened if entitlement doesn't appear to save.
         const grantInfo = { user: grantUserId || null, coach: coach || 'none', rows: null, error: null };
         if (grantUserId && db) {
             try {
-                const expiresAt = planId.includes('yearly')
+                const expiresAt = effectivePlanId.includes('yearly')
                     ? new Date(Date.now() + 365 * 24 * 60 * 60 * 1000)
                     : new Date(Date.now() + 30  * 24 * 60 * 60 * 1000);
 
@@ -2166,7 +2218,7 @@ app.post('/verify-payment', async (req, res) => {
             success:    true,
             payment_id: razorpay_payment_id,
             order_id:   razorpay_order_id,
-            plan:       planId,
+            plan:       effectivePlanId,
             grant:      grantInfo
         });
 
@@ -2246,7 +2298,10 @@ Give 3 strengths, 3 weaknesses, the 2 weakest answers as fixes, and 3 recommenda
 }
 
 // All /coach endpoints share the API secret + require a signed-in user.
-app.use('/coach', validateApiSecret);
+// aiLimiter caps OpenAI spend per IP — coach create/score both hit the model.
+app.use('/coach', validateApiSecret, aiLimiter);
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // Coach entitlement status (frontend uses this to gate UI / route to checkout).
 app.get('/coach/me', requireAuth, async (req, res) => {
@@ -2263,6 +2318,7 @@ app.post('/coach/sessions', requireAuth, async (req, res) => {
     try {
         const { resumeData, company, jobTitle, jobDescription, interviewType, difficulty, mode, length } = req.body;
         if (!jobDescription || jobDescription.trim().length < 30) return res.status(400).json({ error: 'Add a job description (min 30 chars).' });
+        if (jobDescription.length > 12000) return res.status(400).json({ error: 'Job description is too long — paste the relevant part (under 12,000 characters).' });
 
         // Entitlement: Unlimited → allow; else a Session Pass is consumed — but only
         // AFTER question generation succeeds, so an AI failure never burns a pass.
@@ -2272,7 +2328,8 @@ app.post('/coach/sessions', requireAuth, async (req, res) => {
 
         const type  = COACH_TYPES.includes(interviewType) ? interviewType : 'Behavioral';
         const count = [5, 6, 10].includes(length) ? length : 6;
-        const diff  = Math.max(0, Math.min(100, parseInt(difficulty, 10) || 60));
+        const diffN = parseInt(difficulty, 10);
+        const diff  = Math.max(0, Math.min(100, Number.isFinite(diffN) ? diffN : 60));
         const resumeString = serializeResumeData(resumeData);
 
         let questions = [];
@@ -2289,11 +2346,20 @@ app.post('/coach/sessions', requireAuth, async (req, res) => {
             if (!dec.rowCount) return res.status(402).json({ error: 'No session passes left.', code: 'PRO_REQUIRED' });
         }
 
-        const ins = await db.query(
-            `INSERT INTO rn_interview_sessions(user_id,company,job_title,job_description,interview_type,difficulty,mode,resume_snapshot,questions,status)
-             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'in_progress') RETURNING id, questions`,
-            [req.user.id, company || '', jobTitle || '', jobDescription, type, diff, mode === 'text' ? 'text' : 'voice', resumeData || null, JSON.stringify(questions)]
-        );
+        let ins;
+        try {
+            ins = await db.query(
+                `INSERT INTO rn_interview_sessions(user_id,company,job_title,job_description,interview_type,difficulty,mode,resume_snapshot,questions,status)
+                 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'in_progress') RETURNING id, questions`,
+                [req.user.id, String(company || '').slice(0, 255), String(jobTitle || '').slice(0, 255), jobDescription, type, diff, mode === 'text' ? 'text' : 'voice', resumeData || null, JSON.stringify(questions)]
+            );
+        } catch (insErr) {
+            // refund the pass we just consumed — the user got nothing
+            if (!acc.unlimited) {
+                await db.query('UPDATE rn_users SET session_passes = session_passes + 1 WHERE id=$1', [req.user.id]).catch(() => {});
+            }
+            throw insErr;
+        }
         console.log(`[${SERVER_VERSION}] [coach] session ${ins.rows[0].id} created (${type}, ${count}Q, ${mode})`);
         res.json({ id: ins.rows[0].id, questions });
     } catch (e) {
@@ -2316,6 +2382,7 @@ app.get('/coach/sessions', requireAuth, async (req, res) => {
 // Fetch a single owned session.
 app.get('/coach/sessions/:id', requireAuth, async (req, res) => {
     if (!db) return res.status(503).json({ error: 'Coach not configured.' });
+    if (!UUID_RE.test(req.params.id)) return res.status(404).json({ error: 'Session not found.' });
     try {
         const r = await db.query('SELECT * FROM rn_interview_sessions WHERE id=$1 AND user_id=$2', [req.params.id, req.user.id]);
         if (!r.rows.length) return res.status(404).json({ error: 'Session not found.' });
@@ -2323,23 +2390,32 @@ app.get('/coach/sessions/:id', requireAuth, async (req, res) => {
     } catch (e) { res.status(500).json({ error: 'Failed to load session.' }); }
 });
 
-// Submit an answer to a question.
+// Submit an answer. Atomic jsonb append — no read-modify-write race; only
+// in-progress sessions accept answers, capped so the row can't grow unbounded.
 app.post('/coach/sessions/:id/answers', requireAuth, async (req, res) => {
     if (!db) return res.status(503).json({ error: 'Coach not configured.' });
+    if (!UUID_RE.test(req.params.id)) return res.status(404).json({ error: 'Session not found.' });
     try {
         const { questionId, text } = req.body;
-        const r = await db.query('SELECT answers FROM rn_interview_sessions WHERE id=$1 AND user_id=$2', [req.params.id, req.user.id]);
-        if (!r.rows.length) return res.status(404).json({ error: 'Session not found.' });
-        const answers = Array.isArray(r.rows[0].answers) ? r.rows[0].answers : [];
-        answers.push({ questionId: String(questionId || ''), text: truncateText(text, 6000), at: new Date().toISOString() });
-        await db.query('UPDATE rn_interview_sessions SET answers=$1, updated_at=NOW() WHERE id=$2', [JSON.stringify(answers), req.params.id]);
-        res.json({ ok: true, answered: answers.length });
+        if (!/^q\d{1,2}$/.test(String(questionId || ''))) return res.status(400).json({ error: 'Invalid question id.' });
+        const entry = JSON.stringify([{ questionId: String(questionId), text: truncateText(text, 6000), at: new Date().toISOString() }]);
+        const r = await db.query(
+            `UPDATE rn_interview_sessions
+             SET answers = COALESCE(answers,'[]'::jsonb) || $1::jsonb, updated_at = NOW()
+             WHERE id=$2 AND user_id=$3 AND status='in_progress'
+               AND jsonb_array_length(COALESCE(answers,'[]'::jsonb)) < 60
+             RETURNING jsonb_array_length(answers) AS n`,
+            [entry, req.params.id, req.user.id]
+        );
+        if (!r.rowCount) return res.status(409).json({ error: 'Could not save — this interview may already be scored.' });
+        res.json({ ok: true, answered: r.rows[0].n });
     } catch (e) { res.status(500).json({ error: 'Failed to save answer.' }); }
 });
 
 // Generate the scored report.
 app.post('/coach/sessions/:id/score', requireAuth, async (req, res) => {
     if (!db) return res.status(503).json({ error: 'Coach not configured.' });
+    if (!UUID_RE.test(req.params.id)) return res.status(404).json({ error: 'Session not found.' });
     try {
         const r = await db.query('SELECT * FROM rn_interview_sessions WHERE id=$1 AND user_id=$2', [req.params.id, req.user.id]);
         if (!r.rows.length) return res.status(404).json({ error: 'Session not found.' });
@@ -2367,10 +2443,15 @@ app.post('/coach/sessions/:id/score', requireAuth, async (req, res) => {
             console.error('[coach] scoring failed:', aiErr.message);
             return res.status(502).json({ error: 'Could not score the interview. Please try again.' });
         }
-        await db.query(
-            `UPDATE rn_interview_sessions SET report=$1, overall_score=$2, status='scored', completed_at=NOW(), updated_at=NOW() WHERE id=$3`,
+        // First scorer wins — a concurrent score call returns the stored report.
+        const upd = await db.query(
+            `UPDATE rn_interview_sessions SET report=$1, overall_score=$2, status='scored', completed_at=NOW(), updated_at=NOW() WHERE id=$3 AND report IS NULL`,
             [JSON.stringify(report), report.overall, s.id]
         );
+        if (!upd.rowCount) {
+            const re = await db.query('SELECT report, overall_score FROM rn_interview_sessions WHERE id=$1', [s.id]);
+            return res.json({ report: re.rows[0].report, overall: re.rows[0].overall_score });
+        }
         console.log(`[${SERVER_VERSION}] [coach] session ${s.id} scored → ${report.overall}`);
         res.json({ report, overall: report.overall });
     } catch (e) {
@@ -2380,11 +2461,15 @@ app.post('/coach/sessions/:id/score', requireAuth, async (req, res) => {
 });
 
 
-app.listen(PORT, () => {
-    console.log(`[${SERVER_VERSION}] Server running on port ${PORT}`);
-});
-
 app.use((err, req, res, next) => {
     console.error(err);
-    res.status(500).json({ error: 'Something went wrong.' });
+    if (!res.headersSent) res.status(500).json({ error: 'Something went wrong.' });
+});
+
+// Don't serve requests before tables exist on a cold start; schema failures
+// still boot (the .catch above resolves) so a migration hiccup isn't an outage.
+schemaReady.then(() => {
+    app.listen(PORT, () => {
+        console.log(`[${SERVER_VERSION}] Server running on port ${PORT}`);
+    });
 });
