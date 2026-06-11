@@ -74,7 +74,7 @@ app.use(
 );
 
 // --- Version marker ---------------------------------------------------------
-const SERVER_VERSION = 'v12.3-coach-2026';
+const SERVER_VERSION = 'v12.4-coach-2026';
 const BOOT_TIME      = Date.now();
 
 // --- Auth config ------------------------------------------------------------
@@ -2321,7 +2321,16 @@ function coachAccess(u) {
 }
 
 // Generate interview questions tailored to the résumé + JD + config.
-async function coachGenerateQuestions({ resumeString, company, jobTitle, jobDescription, interviewType, difficulty, count }) {
+async function coachGenerateQuestions({ resumeString, company, jobTitle, jobDescription, interviewType, difficulty, count, avoid = [] }) {
+    // Per-session variation: same résumé + JD must still produce a fresh set.
+    const LENSES = [
+        'delivery under deadline pressure', 'stakeholder conflict and influence',
+        'technical depth and trade-offs', 'failure, debugging and lessons learned',
+        'scale, performance and reliability', 'ownership and cross-team leadership',
+        'ambiguity and prioritisation', 'metrics and business impact'
+    ];
+    const lenses = LENSES.slice().sort(() => Math.random() - 0.5).slice(0, 3);
+    const seed = Math.random().toString(36).slice(2, 8);
     const sys = `You are an elite interviewer running a realistic ${interviewType} interview for the role below.
 Generate exactly ${count} questions, ordered from warm-up to hardest.
 Difficulty ${difficulty}/100 (higher = sharper, more probing, more quantitative).
@@ -2330,10 +2339,14 @@ BALANCE REQUIREMENT — this is what makes the interview feel real:
 - At least HALF the questions must directly probe specific requirements, responsibilities, technologies, or qualifications stated in the JOB DESCRIPTION (name them explicitly in the question, the way the hiring manager who wrote the JD would).
 - The remaining questions connect the candidate's actual résumé experience to THIS role — gaps between their background and the JD's demands are prime material.
 - If the job description names concrete skills/tools/duties, they MUST appear across the question set. Never produce a question that could have been written without reading the JD.
+EVERY SESSION MUST FEEL FRESH: given the same résumé and job description, a re-run must produce a substantially different set — vary the requirements you probe, the angle of attack, and the scenarios. Never default to the most obvious first-pass questions if alternatives exist.
 Return ONLY JSON: {"questions":[{"text":"...","focus":"2-4 word tag","hint":"the single key phrase in the question to emphasise"}]}`;
-    const user = `=== ROLE ===\n${sanitizeInput(jobTitle)} at ${sanitizeInput(company)}\n\n=== JOB DESCRIPTION ===\n${truncateText(jobDescription, 4000)}\n\n=== CANDIDATE RÉSUMÉ ===\n${truncateText(resumeString, 6000)}\n\nReturn ${count} questions as JSON.`;
+    const avoidBlock = avoid.length
+        ? `\n\n=== DO NOT REPEAT ===\nThe candidate has interviewed for this role before. Do NOT reuse or closely paraphrase any of these previously asked questions:\n${avoid.slice(0, 18).map(q => '- ' + q).join('\n')}`
+        : '';
+    const user = `=== ROLE ===\n${sanitizeInput(jobTitle)} at ${sanitizeInput(company)}\n\n=== JOB DESCRIPTION ===\n${truncateText(jobDescription, 4000)}\n\n=== CANDIDATE RÉSUMÉ ===\n${truncateText(resumeString, 6000)}\n\n=== SESSION VARIATION (seed ${seed}) ===\nLean this session's questions toward: ${lenses.join('; ')}.${avoidBlock}\n\nReturn ${count} questions as JSON.`;
     const c = await openai.chat.completions.create({
-        model: 'gpt-4.1-mini', temperature: 0.6, max_tokens: 1200,
+        model: 'gpt-4.1-mini', temperature: 0.85, max_tokens: 1200,
         response_format: { type: 'json_object' },
         messages: [{ role: 'system', content: sys }, { role: 'user', content: user }],
     });
@@ -2413,9 +2426,21 @@ app.post('/coach/sessions', requireAuth, aiLimiter, async (req, res) => {
         const diff  = Math.max(0, Math.min(100, Number.isFinite(diffN) ? diffN : 60));
         const resumeString = serializeResumeData(resumeData);
 
+        // Previously asked questions for this user+role → the generator must avoid them
+        let avoid = [];
+        try {
+            const prev = await db.query(
+                `SELECT questions FROM rn_interview_sessions
+                 WHERE user_id=$1 AND (job_title=$2 OR company=$3)
+                 ORDER BY created_at DESC LIMIT 3`,
+                [req.user.id, String(jobTitle || '').slice(0, 255), String(company || '').slice(0, 255)]
+            );
+            avoid = prev.rows.flatMap(r => (Array.isArray(r.questions) ? r.questions : []).map(q => String(q.text || '').slice(0, 200))).filter(Boolean);
+        } catch (e) { /* variety aid only — never block creation */ }
+
         let questions = [];
         try {
-            questions = await coachGenerateQuestions({ resumeString, company, jobTitle, jobDescription, interviewType: type, difficulty: diff, count });
+            questions = await coachGenerateQuestions({ resumeString, company, jobTitle, jobDescription, interviewType: type, difficulty: diff, count, avoid });
         } catch (aiErr) {
             console.error('[coach] question gen failed:', aiErr.message);
             return res.status(502).json({ error: 'Could not generate questions. Please try again.' });
