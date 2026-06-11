@@ -21,6 +21,8 @@ app.set('trust proxy', 1);
 const ALLOWED_ORIGINS_EXTRA_LIST = (process.env.ALLOWED_ORIGINS_EXTRA || '').split(',').filter(Boolean);
 const ALLOWED_ORIGINS = [
     'https://developwithrax-dev-ed.my.site.com',
+    'https://renonym.com',
+    'https://www.renonym.com',
     process.env.FRONTEND_URL || '',
     ...ALLOWED_ORIGINS_EXTRA_LIST
 ].filter(Boolean);
@@ -30,7 +32,7 @@ app.use(cors({
         if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
         cb(new Error('Not allowed by CORS'));
     },
-    methods:      ['GET', 'POST', 'DELETE'],
+    methods:      ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS'],   // tracker uses PATCH — its absence broke every stage/star update
     allowedHeaders: ['Content-Type', 'x-client-id', 'Authorization', 'x-api-secret'],
     credentials:  true
 }));
@@ -74,7 +76,7 @@ app.use(
 );
 
 // --- Version marker ---------------------------------------------------------
-const SERVER_VERSION = 'v13.1-tracker-2026';
+const SERVER_VERSION = 'v13.2-tracker-2026';
 const BOOT_TIME      = Date.now();
 
 // --- Auth config ------------------------------------------------------------
@@ -405,7 +407,7 @@ async function enforceDailyQuota(req, res, next) {
     if (!db) return next(); // no DB configured (dev) — cannot enforce
     try {
         const r = await db.query(
-            `SELECT plan,
+            `SELECT plan, coach_plan, coach_expires,
                     CASE WHEN daily_premium_date = CURRENT_DATE THEN daily_premium_count ELSE 0 END AS used
              FROM rn_users WHERE id = $1`,
             [req.user.id]
@@ -413,7 +415,8 @@ async function enforceDailyQuota(req, res, next) {
         if (!r.rows.length) return res.status(401).json({ error: 'Account not found.', code: 'AUTH_REQUIRED' });
         const plan  = r.rows[0].plan;
         const used  = r.rows[0].used;
-        const isPro = plan === 'pro';
+        // Coach Unlimited is the paid tier actually sold — it carries the paid benefits
+        const isPro = plan === 'pro' || coachAccess(r.rows[0]).unlimited;
 
         if (!isPro && used >= FREE_DAILY_QUOTA) {
             return res.status(402).json({
@@ -451,9 +454,10 @@ async function enforceDailyQuota(req, res, next) {
 async function requirePro(req, res, next) {
     if (!db) return next();
     try {
-        const r = await db.query('SELECT plan FROM rn_users WHERE id = $1', [req.user.id]);
+        const r = await db.query('SELECT plan, coach_plan, coach_expires FROM rn_users WHERE id = $1', [req.user.id]);
         const plan = (r.rows[0] && r.rows[0].plan) || 'free';
-        if (plan !== 'pro') {
+        const paid = plan === 'pro' || (r.rows[0] && coachAccess(r.rows[0]).unlimited);
+        if (!paid) {
             return res.status(402).json({
                 error: 'Downloading is a Pro feature. Upgrade to download your resume without a watermark.',
                 code: 'PRO_REQUIRED', plan
