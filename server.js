@@ -74,7 +74,7 @@ app.use(
 );
 
 // --- Version marker ---------------------------------------------------------
-const SERVER_VERSION = 'v12.1-coach-2026';
+const SERVER_VERSION = 'v12.2-coach-2026';
 const BOOT_TIME      = Date.now();
 
 // --- Auth config ------------------------------------------------------------
@@ -543,6 +543,12 @@ html, body {
     float: none !important;
 }
 .rb-resume:hover { transform: none !important; }
+
+/* -- 3b. The app shell is dark, but the PDF page is always white paper ---- */
+html, body {
+    background: #ffffff !important;
+    color-scheme: light !important;
+}
 
 /* -- 4. Header: full-width strip, auto height ---------------------------- */
 .rb-resume__header {
@@ -1965,7 +1971,8 @@ app.get('/auth/me', requireAuth, async (req, res) => {
         const u = r.rows[0];
         res.json({ id:u.id, email:u.email, name:u.name, avatarUrl:u.avatar_url,
             plan:u.plan, resumeCount:u.resume_count, atsCount:u.ats_reports_count,
-            createdAt:u.created_at, lastLoginAt:u.last_login_at });
+            createdAt:u.created_at, lastLoginAt:u.last_login_at,
+            coach: coachAccess(u) });   // { unlimited, passes, has } — one call refreshes everything
     } catch (e) { res.status(500).json({ error: 'Failed to load profile.' }); }
 });
 
