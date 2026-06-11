@@ -74,7 +74,7 @@ app.use(
 );
 
 // --- Version marker ---------------------------------------------------------
-const SERVER_VERSION = 'v12.4-coach-2026';
+const SERVER_VERSION = 'v13.1-tracker-2026';
 const BOOT_TIME      = Date.now();
 
 // --- Auth config ------------------------------------------------------------
@@ -188,6 +188,48 @@ if (process.env.DATABASE_URL) {
             user_id    UUID,
             created_at TIMESTAMPTZ  DEFAULT NOW()
         );
+
+        -- ── Application Tracker (job-search CRM) ─────────────────────────
+        -- rn_jobs is the application record; rn_job_events is the uniform
+        -- CRM timeline (notes, rounds, recruiter contacts, salary threads,
+        -- follow-ups) — type + optional due_at/done covers all of them.
+        CREATE TABLE IF NOT EXISTS rn_jobs (
+            id              UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+            user_id         UUID         NOT NULL REFERENCES rn_users(id) ON DELETE CASCADE,
+            company         VARCHAR(255) NOT NULL,
+            title           VARCHAR(255) NOT NULL,
+            location        VARCHAR(255),
+            url             TEXT,
+            source          VARCHAR(100),
+            jd              TEXT,
+            salary_min      INTEGER,
+            salary_max      INTEGER,
+            salary_currency VARCHAR(8)   DEFAULT 'INR',
+            salary_notes    TEXT,
+            stage           VARCHAR(20)  DEFAULT 'saved',
+            excitement      INTEGER      DEFAULT 3,
+            next_action     VARCHAR(255),
+            next_action_due TIMESTAMPTZ,
+            applied_at      TIMESTAMPTZ,
+            archived        BOOLEAN      DEFAULT FALSE,
+            created_at      TIMESTAMPTZ  DEFAULT NOW(),
+            updated_at      TIMESTAMPTZ  DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_rn_jobs_user ON rn_jobs(user_id, archived, stage);
+        CREATE TABLE IF NOT EXISTS rn_job_events (
+            id         UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+            job_id     UUID         NOT NULL REFERENCES rn_jobs(id) ON DELETE CASCADE,
+            user_id    UUID         NOT NULL REFERENCES rn_users(id) ON DELETE CASCADE,
+            type       VARCHAR(30)  NOT NULL,
+            title      VARCHAR(255),
+            body       TEXT,
+            due_at     TIMESTAMPTZ,
+            done       BOOLEAN      DEFAULT FALSE,
+            meta       JSONB,
+            created_at TIMESTAMPTZ  DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_rn_job_events_job ON rn_job_events(job_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_rn_job_events_due ON rn_job_events(user_id, done, due_at);
     `)
     .then(() => console.log('[DB] Schema ready'))
     .catch(e => console.error('[DB] Schema init:', e.message));
@@ -2634,6 +2676,266 @@ app.post('/coach/sessions/:id/transcribe', requireAuth, coachMediaLimiter,
         console.error('[coach] transcribe error:', e.message);
         res.status(502).json({ error: 'Could not transcribe your answer.' });
     }
+});
+
+
+// ============================================================================
+// APPLICATION TRACKER — job-search CRM (jobs + uniform event timeline)
+// ============================================================================
+// Same gates as /coach: shared API secret + signed-in user. No AI calls.
+const trackerWriteLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 120,                    // generous for humans, blocks scripted bloat
+    message: { error: 'Too many changes at once — slow down a little.' }
+});
+app.use('/tracker', validateApiSecret);
+app.use('/tracker', (req, res, next) => req.method === 'GET' ? next() : trackerWriteLimiter(req, res, next));
+
+const JOB_STAGES  = ['saved', 'applied', 'interviewing', 'offer', 'rejected'];
+const EVENT_TYPES = ['note', 'stage', 'round', 'contact', 'salary', 'followup', 'task', 'offer', 'rejection'];
+
+const jobStr = (v, max) => (v === undefined || v === null) ? null : String(v).slice(0, max);
+const jobInt = (v) => { const n = parseInt(v, 10); return Number.isFinite(n) ? Math.max(-2147483648, Math.min(2147483647, n)) : null; };
+const jobDate = (v) => { if (!v) return null; const d = new Date(v); return isNaN(d) ? null : d; };
+
+// List jobs (board). q searches company/title; archived hidden by default.
+app.get('/tracker/jobs', requireAuth, async (req, res) => {
+    if (!db) return res.status(503).json({ error: 'Tracker not configured.' });
+    try {
+        const params = [req.user.id];
+        let where = 'user_id=$1';
+        if (req.query.archived === 'true') { where += ' AND archived=TRUE'; }
+        else { where += ' AND archived=FALSE'; }
+        if (req.query.stage && JOB_STAGES.includes(req.query.stage)) { params.push(req.query.stage); where += ` AND stage=$${params.length}`; }
+        if (req.query.q) { params.push('%' + String(req.query.q).slice(0, 100) + '%'); where += ` AND (company ILIKE $${params.length} OR title ILIKE $${params.length})`; }
+        const r = await db.query(
+            `SELECT id, company, title, location, url, source, stage, excitement,
+                    salary_min, salary_max, salary_currency,
+                    next_action, next_action_due, applied_at, created_at, updated_at
+             FROM rn_jobs WHERE ${where} ORDER BY updated_at DESC LIMIT 500`, params);
+        res.json({ jobs: r.rows });
+    } catch (e) { console.error('[tracker] list error:', e.message); res.status(500).json({ error: 'Failed to load jobs.' }); }
+});
+
+// Create a job. Logs the initial stage event.
+app.post('/tracker/jobs', requireAuth, async (req, res) => {
+    if (!db) return res.status(503).json({ error: 'Tracker not configured.' });
+    try {
+        const b = req.body || {};
+        const company = jobStr(b.company, 255), title = jobStr(b.title, 255);
+        if (!company || !company.trim() || !title || !title.trim()) {
+            return res.status(400).json({ error: 'Company and job title are required.' });
+        }
+        const stage = JOB_STAGES.includes(b.stage) ? b.stage : 'saved';
+        const exc = Math.max(1, Math.min(5, jobInt(b.excitement) || 3));
+        const r = await db.query(
+            `INSERT INTO rn_jobs(user_id, company, title, location, url, source, jd,
+                                 salary_min, salary_max, salary_currency, salary_notes,
+                                 stage, excitement, next_action, next_action_due, applied_at)
+             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *`,
+            [req.user.id, company.trim(), title.trim(), jobStr(b.location, 255), jobStr(b.url, 2000),
+             jobStr(b.source, 100), jobStr(b.jd, 12000), jobInt(b.salaryMin), jobInt(b.salaryMax),
+             jobStr(b.salaryCurrency, 8) || 'INR', jobStr(b.salaryNotes, 2000),
+             stage, exc, jobStr(b.nextAction, 255), jobDate(b.nextActionDue),
+             ['applied', 'interviewing', 'offer'].includes(stage) ? new Date() : null]);
+        const job = r.rows[0];
+        await db.query(`INSERT INTO rn_job_events(job_id, user_id, type, title) VALUES($1,$2,'stage',$3)`,
+            [job.id, req.user.id, `Added to pipeline as "${stage}"`]).catch(() => {});
+        console.log(`[${SERVER_VERSION}] [tracker] job created ${job.id} (${stage})`);
+        res.json(job);
+    } catch (e) { console.error('[tracker] create error:', e.message); res.status(500).json({ error: 'Failed to save the job.' }); }
+});
+
+// Job + its timeline.
+app.get('/tracker/jobs/:id', requireAuth, async (req, res) => {
+    if (!db) return res.status(503).json({ error: 'Tracker not configured.' });
+    if (!UUID_RE.test(req.params.id)) return res.status(404).json({ error: 'Job not found.' });
+    try {
+        const r = await db.query('SELECT * FROM rn_jobs WHERE id=$1 AND user_id=$2', [req.params.id, req.user.id]);
+        if (!r.rows.length) return res.status(404).json({ error: 'Job not found.' });
+        const ev = await db.query(
+            'SELECT * FROM rn_job_events WHERE job_id=$1 AND user_id=$2 ORDER BY created_at DESC LIMIT 200',
+            [req.params.id, req.user.id]);
+        res.json({ job: r.rows[0], events: ev.rows });
+    } catch (e) { console.error('[tracker] get error:', e.message); res.status(500).json({ error: 'Failed to load the job.' }); }
+});
+
+// Update job fields; stage moves are logged and stamp applied_at.
+app.patch('/tracker/jobs/:id', requireAuth, async (req, res) => {
+    if (!db) return res.status(503).json({ error: 'Tracker not configured.' });
+    if (!UUID_RE.test(req.params.id)) return res.status(404).json({ error: 'Job not found.' });
+    try {
+        const cur = await db.query('SELECT * FROM rn_jobs WHERE id=$1 AND user_id=$2', [req.params.id, req.user.id]);
+        if (!cur.rows.length) return res.status(404).json({ error: 'Job not found.' });
+        const j = cur.rows[0];
+        const b = req.body || {};
+        const stageProvided = b.stage !== undefined && JOB_STAGES.includes(b.stage) && b.stage !== j.stage;
+        const stage = stageProvided ? b.stage : j.stage;
+        const pick = (key, val, max) => b[key] !== undefined ? jobStr(val, max) : undefined;
+        const nonEmpty = (v) => { const t = v === undefined ? undefined : jobStr(v, 255); return (t && t.trim()) ? t.trim() : undefined; };
+        const fields = {
+            company: nonEmpty(b.company), title: nonEmpty(b.title),
+            location: pick('location', b.location, 255), url: pick('url', b.url, 2000),
+            source: pick('source', b.source, 100), jd: pick('jd', b.jd, 12000),
+            salary_min: b.salaryMin !== undefined ? jobInt(b.salaryMin) : undefined,
+            salary_max: b.salaryMax !== undefined ? jobInt(b.salaryMax) : undefined,
+            salary_currency: pick('salaryCurrency', b.salaryCurrency, 8),
+            salary_notes: pick('salaryNotes', b.salaryNotes, 2000),
+            excitement: b.excitement !== undefined ? Math.max(1, Math.min(5, jobInt(b.excitement) || 3)) : undefined,
+            next_action: pick('nextAction', b.nextAction, 255),
+            next_action_due: b.nextActionDue !== undefined ? jobDate(b.nextActionDue) : undefined,
+            archived: b.archived !== undefined ? !!b.archived : undefined,
+            stage: stageProvided ? stage : undefined,
+        };
+        const sets = [], vals = [];
+        for (const [k, v] of Object.entries(fields)) {
+            if (v === undefined) continue;
+            vals.push(v); sets.push(`${k}=$${vals.length}`);
+        }
+        if (stageProvided && ['applied', 'interviewing', 'offer'].includes(stage) && !j.applied_at) { vals.push(new Date()); sets.push(`applied_at=$${vals.length}`); }
+        sets.push('updated_at=NOW()');
+        vals.push(req.params.id, req.user.id);
+        const r = await db.query(
+            `UPDATE rn_jobs SET ${sets.join(', ')} WHERE id=$${vals.length - 1} AND user_id=$${vals.length} RETURNING *`, vals);
+        if (stageProvided) {
+            await db.query(`INSERT INTO rn_job_events(job_id, user_id, type, title) VALUES($1,$2,'stage',$3)`,
+                [req.params.id, req.user.id, `Moved to "${stage}"`]).catch(() => {});
+        }
+        res.json(r.rows[0]);
+    } catch (e) { console.error('[tracker] patch error:', e.message); res.status(500).json({ error: 'Failed to update the job.' }); }
+});
+
+// Archive (soft delete).
+app.delete('/tracker/jobs/:id', requireAuth, async (req, res) => {
+    if (!db) return res.status(503).json({ error: 'Tracker not configured.' });
+    if (!UUID_RE.test(req.params.id)) return res.status(404).json({ error: 'Job not found.' });
+    try {
+        const r = await db.query('UPDATE rn_jobs SET archived=TRUE, updated_at=NOW() WHERE id=$1 AND user_id=$2', [req.params.id, req.user.id]);
+        if (!r.rowCount) return res.status(404).json({ error: 'Job not found.' });
+        res.json({ ok: true });
+    } catch (e) { res.status(500).json({ error: 'Failed to archive the job.' }); }
+});
+
+// Add a timeline event (note / round / contact / salary / followup / ...).
+app.post('/tracker/jobs/:id/events', requireAuth, async (req, res) => {
+    if (!db) return res.status(503).json({ error: 'Tracker not configured.' });
+    if (!UUID_RE.test(req.params.id)) return res.status(404).json({ error: 'Job not found.' });
+    try {
+        const own = await db.query('SELECT id FROM rn_jobs WHERE id=$1 AND user_id=$2', [req.params.id, req.user.id]);
+        if (!own.rows.length) return res.status(404).json({ error: 'Job not found.' });
+        const b = req.body || {};
+        const type = EVENT_TYPES.includes(b.type) ? b.type : 'note';
+        const title = jobStr(b.title, 255), body = jobStr(b.body, 6000);
+        if ((!title || !title.trim()) && (!body || !body.trim())) {
+            return res.status(400).json({ error: 'Write something first.' });
+        }
+        const r = await db.query(
+            `INSERT INTO rn_job_events(job_id, user_id, type, title, body, due_at, meta)
+             VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+            [req.params.id, req.user.id, type, title, body, jobDate(b.dueAt),
+             (() => { if (!b.meta || typeof b.meta !== 'object') return null; const m = JSON.stringify(b.meta); return m.length <= 4000 ? m : null; })()]);
+        await db.query('UPDATE rn_jobs SET updated_at=NOW() WHERE id=$1', [req.params.id]).catch(() => {});
+        res.json(r.rows[0]);
+    } catch (e) { console.error('[tracker] event error:', e.message); res.status(500).json({ error: 'Failed to save.' }); }
+});
+
+// Edit / complete an event.
+app.patch('/tracker/events/:id', requireAuth, async (req, res) => {
+    if (!db) return res.status(503).json({ error: 'Tracker not configured.' });
+    if (!UUID_RE.test(req.params.id)) return res.status(404).json({ error: 'Not found.' });
+    try {
+        const b = req.body || {};
+        const sets = [], vals = [];
+        if (b.done !== undefined) { vals.push(!!b.done); sets.push(`done=$${vals.length}`); }
+        if (b.title !== undefined) { vals.push(jobStr(b.title, 255)); sets.push(`title=$${vals.length}`); }
+        if (b.body !== undefined) { vals.push(jobStr(b.body, 6000)); sets.push(`body=$${vals.length}`); }
+        if (b.dueAt !== undefined) { vals.push(jobDate(b.dueAt)); sets.push(`due_at=$${vals.length}`); }
+        if (!sets.length) return res.status(400).json({ error: 'Nothing to update.' });
+        vals.push(req.params.id, req.user.id);
+        const r = await db.query(
+            `UPDATE rn_job_events SET ${sets.join(', ')} WHERE id=$${vals.length - 1} AND user_id=$${vals.length} RETURNING *`, vals);
+        if (!r.rows.length) return res.status(404).json({ error: 'Not found.' });
+        await db.query('UPDATE rn_jobs SET updated_at=NOW() WHERE id=$1 AND user_id=$2', [r.rows[0].job_id, req.user.id]).catch(() => {});
+        res.json(r.rows[0]);
+    } catch (e) { res.status(500).json({ error: 'Failed to update.' }); }
+});
+
+app.delete('/tracker/events/:id', requireAuth, async (req, res) => {
+    if (!db) return res.status(503).json({ error: 'Tracker not configured.' });
+    if (!UUID_RE.test(req.params.id)) return res.status(404).json({ error: 'Not found.' });
+    try {
+        const r = await db.query('DELETE FROM rn_job_events WHERE id=$1 AND user_id=$2', [req.params.id, req.user.id]);
+        if (!r.rowCount) return res.status(404).json({ error: 'Not found.' });
+        res.json({ ok: true });
+    } catch (e) { res.status(500).json({ error: 'Failed to delete.' }); }
+});
+
+// The daily loop: overdue / today / upcoming dated items + computed
+// follow-up suggestions (applied jobs silent for 7+ days, nothing pending).
+app.get('/tracker/agenda', requireAuth, async (req, res) => {
+    if (!db) return res.status(503).json({ error: 'Tracker not configured.' });
+    try {
+        const due = await db.query(
+            `SELECT e.id, e.job_id, e.type, e.title, e.due_at, j.company, j.title AS job_title
+             FROM rn_job_events e JOIN rn_jobs j ON j.id = e.job_id
+             WHERE e.user_id=$1 AND e.done=FALSE AND e.due_at IS NOT NULL
+               AND e.due_at < NOW() + (CASE WHEN e.type='round' THEN INTERVAL '30 days' ELSE INTERVAL '7 days' END)
+               AND j.archived=FALSE
+             ORDER BY e.due_at ASC LIMIT 50`, [req.user.id]);
+        const nextActions = await db.query(
+            `SELECT id AS job_id, company, title AS job_title, next_action AS title, next_action_due AS due_at
+             FROM rn_jobs
+             WHERE user_id=$1 AND archived=FALSE AND next_action IS NOT NULL AND next_action_due IS NOT NULL
+               AND next_action_due < NOW() + INTERVAL '7 days'
+             ORDER BY next_action_due ASC LIMIT 50`, [req.user.id]);
+        const suggested = await db.query(
+            `SELECT j.id AS job_id, j.company, j.title AS job_title, j.stage, j.updated_at
+             FROM rn_jobs j
+             WHERE j.user_id=$1 AND j.archived=FALSE
+               AND ((j.stage='applied'      AND j.updated_at < NOW() - INTERVAL '7 days')
+                 OR (j.stage='interviewing' AND j.updated_at < NOW() - INTERVAL '14 days'))
+               AND NOT EXISTS (SELECT 1 FROM rn_job_events e WHERE e.job_id=j.id AND e.done=FALSE AND e.type='followup')
+             ORDER BY j.updated_at ASC LIMIT 10`, [req.user.id]);
+        const items = [
+            ...due.rows.map(r => ({ ...r, kind: 'event' })),
+            ...nextActions.rows.map(r => ({ ...r, kind: 'next_action', type: 'task' })),
+        ];
+        const now = Date.now(), endOfToday = new Date(); endOfToday.setHours(23, 59, 59, 999);
+        res.json({
+            overdue:   items.filter(i => new Date(i.due_at).getTime() < now && new Date(i.due_at).toDateString() !== new Date().toDateString()),
+            today:     items.filter(i => new Date(i.due_at).toDateString() === new Date().toDateString()),
+            upcoming:  items.filter(i => new Date(i.due_at).getTime() > endOfToday.getTime()),
+            suggested: suggested.rows,
+        });
+    } catch (e) { console.error('[tracker] agenda error:', e.message); res.status(500).json({ error: 'Failed to load your agenda.' }); }
+});
+
+// Momentum metrics for the insights strip.
+app.get('/tracker/insights', requireAuth, async (req, res) => {
+    if (!db) return res.status(503).json({ error: 'Tracker not configured.' });
+    try {
+        const stages = await db.query(
+            `SELECT stage, COUNT(*)::int AS n FROM rn_jobs WHERE user_id=$1 AND archived=FALSE GROUP BY stage`, [req.user.id]);
+        const week = await db.query(
+            `SELECT
+               COUNT(*) FILTER (WHERE applied_at >= NOW() - INTERVAL '7 days')::int  AS applied_this_week,
+               COUNT(*) FILTER (WHERE applied_at >= NOW() - INTERVAL '14 days'
+                                AND applied_at <  NOW() - INTERVAL '7 days')::int    AS applied_last_week,
+               COUNT(*) FILTER (WHERE stage IN ('interviewing','offer') AND applied_at IS NOT NULL)::int AS progressed,
+               COUNT(*) FILTER (WHERE applied_at IS NOT NULL)::int                    AS applied_total,
+               COUNT(*) FILTER (WHERE stage='offer')::int                             AS offers
+             FROM rn_jobs WHERE user_id=$1 AND archived=FALSE`, [req.user.id]);
+        const w = week.rows[0];
+        const byStage = {}; stages.rows.forEach(r => { byStage[r.stage] = r.n; });
+        res.json({
+            stages: byStage,
+            appliedThisWeek: w.applied_this_week,
+            appliedLastWeek: w.applied_last_week,
+            responseRate: w.applied_total ? Math.round((w.progressed / w.applied_total) * 100) : null,
+            offers: w.offers,
+            active: (byStage.saved || 0) + (byStage.applied || 0) + (byStage.interviewing || 0) + (byStage.offer || 0),
+        });
+    } catch (e) { console.error('[tracker] insights error:', e.message); res.status(500).json({ error: 'Failed to load insights.' }); }
 });
 
 
