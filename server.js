@@ -301,6 +301,29 @@ if (process.env.RESEND_API_KEY) {
     });
 }
 
+// --- JD corpus logging (Phase 7) --------------------------------------------
+// Aggregate real job descriptions for future benchmarking / model work. Stored
+// pseudonymously: the user is recorded as an HMAC (salted with JWT_SECRET) so a
+// row can't be tied back to a person without the server secret. Fire-and-forget
+// via setImmediate — it runs AFTER the response is sent, never adds latency, and
+// never throws into the request path.
+function logJdCorpus(userId, rawText, source) {
+    if (!db || !rawText) return;
+    const text = String(rawText).trim();
+    if (text.length < 40) return;   // skip trivial/empty pastes
+    setImmediate(async () => {
+        try {
+            const hash = userId
+                ? crypto.createHmac('sha256', JWT_SECRET).update(String(userId)).digest('hex')
+                : null;
+            await db.query(
+                'INSERT INTO rn_jd_corpus(user_hash, raw_text, tags) VALUES($1,$2,$3)',
+                [hash, text.slice(0, 12000), JSON.stringify({ source: source || 'unknown' })]
+            );
+        } catch (e) { console.error('[jd-corpus] log failed:', e.message); }
+    });
+}
+
 // --- IP-based rate limiters (first line of defence) -------------------------
 const aiLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,   // 15 minutes
@@ -1788,6 +1811,7 @@ Return ONLY this JSON (no markdown fences):
         });
 
         console.log(`[${SERVER_VERSION}] /analyze-job-match - ATS:${result.atsScore} JD:${result.jdMatch}${req.user ? '' : ' (anon teaser)'}`);
+        logJdCorpus(req.user && req.user.id, jobDescription, req.user ? 'jdmatch' : 'jdmatch-anon');
         if (!req.user) {
             // anonymous teaser: scores + top-3 gaps — the full report is the
             // signup hook (free account + 2 starter credits)
@@ -3253,6 +3277,7 @@ app.post('/tracker/jobs', requireAuth, async (req, res) => {
         const job = r.rows[0];
         await db.query(`INSERT INTO rn_job_events(job_id, user_id, type, title) VALUES($1,$2,'stage',$3)`,
             [job.id, req.user.id, `Added to pipeline as "${stage}"`]).catch(() => {});
+        logJdCorpus(req.user.id, b.jd, 'tracker-create');
         console.log(`[${SERVER_VERSION}] [tracker] job created ${job.id} (${stage})`);
         res.json(job);
     } catch (e) { console.error('[tracker] create error:', e.message); res.status(500).json({ error: 'Failed to save the job.' }); }
@@ -3313,6 +3338,7 @@ app.patch('/tracker/jobs/:id', requireAuth, async (req, res) => {
             await db.query(`INSERT INTO rn_job_events(job_id, user_id, type, title) VALUES($1,$2,'stage',$3)`,
                 [req.params.id, req.user.id, `Moved to "${stage}"`]).catch(() => {});
         }
+        if (b.jd !== undefined) logJdCorpus(req.user.id, b.jd, 'tracker-edit');
         res.json(r.rows[0]);
     } catch (e) { console.error('[tracker] patch error:', e.message); res.status(500).json({ error: 'Failed to update the job.' }); }
 });
