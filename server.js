@@ -76,7 +76,7 @@ app.use(
 );
 
 // --- Version marker ---------------------------------------------------------
-const SERVER_VERSION = 'v14.5-sec-2026';
+const SERVER_VERSION = 'v14.6-lifecycle-2026';
 const BOOT_TIME      = Date.now();
 
 // --- Auth config ------------------------------------------------------------
@@ -321,6 +321,98 @@ function logJdCorpus(userId, rawText, source) {
                 [hash, text.slice(0, 12000), JSON.stringify({ source: source || 'unknown' })]
             );
         } catch (e) { console.error('[jd-corpus] log failed:', e.message); }
+    });
+}
+
+// --- Lifecycle emails (Phase 8) ---------------------------------------------
+// Reuses the magic-link transporter (Resend/SMTP). Every send is fire-and-forget
+// (setImmediate) so it never blocks a response, and is a no-op when no mailer is
+// configured (logs and skips). User-supplied strings are HTML-escaped before
+// they enter the template.
+const FROM_ADDR = process.env.SMTP_FROM    || 'noreply@renonym.ai';
+const APP_WEB   = process.env.APP_WEB_URL  || 'https://www.renonym.com';
+function htmlEsc(s) {
+    return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+function emailShell(inner) {
+    return `<div style="font-family:system-ui,-apple-system,sans-serif;max-width:480px;margin:0 auto;padding:32px 24px;">
+<div style="background:#0b0c1a;border-radius:16px;padding:32px;">
+<div style="font-size:24px;font-weight:900;color:#f0f0f8;letter-spacing:-0.04em;text-align:center;">Renonym AI</div>
+<p style="color:rgba(255,255,255,0.45);font-size:12px;text-align:center;margin:4px 0 26px">Build · Tailor · Practice · Track</p>
+${inner}
+<p style="margin-top:28px;font-size:11px;color:rgba(255,255,255,0.25);text-align:center;line-height:1.5;">You're receiving this because you have a Renonym account. Reply to this email if you'd prefer not to.</p>
+</div></div>`;
+}
+function emailCta(text, url) {
+    return `<div style="text-align:center;margin:22px 0 2px"><a href="${htmlEsc(url)}" style="display:inline-block;background:linear-gradient(135deg,#7c3aed,#9333ea);color:#fff;text-decoration:none;padding:13px 32px;border-radius:10px;font-weight:700;font-size:15px;">${htmlEsc(text)}</a></div>`;
+}
+function sendEmail(to, subject, inner) {
+    if (!mailer) { console.log('[email] skipped (no mailer):', subject); return; }
+    if (!to || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) return;
+    setImmediate(async () => {
+        try {
+            await mailer.sendMail({ from: FROM_ADDR, to, subject, html: emailShell(inner) });
+            console.log('[email] sent:', subject, '→', to);
+        } catch (e) { console.error('[email] send failed:', e.message); }
+    });
+}
+
+// New account → welcome + the free-credit nudge.
+function sendWelcomeEmail(user) {
+    if (!user || !user.email) return;
+    const name = htmlEsc((user.name || '').split(' ')[0]);
+    sendEmail(user.email, 'Welcome to Renonym — your free credits are ready',
+        `<p style="color:#f0f0f8;font-size:16px;line-height:1.6;">Welcome${name ? ', ' + name : ''} 👋</p>
+<p style="color:rgba(255,255,255,0.7);font-size:14px;line-height:1.6;">Your account is set up with <strong style="color:#c4b5fd">2 free AI credits</strong> and a <strong style="color:#c4b5fd">free practice interview</strong>. Build an ATS-ready résumé, tailor it to any job in one click, and rehearse the real interview before it happens.</p>
+${emailCta('Start building →', APP_WEB + '/builder')}`);
+}
+
+// Successful purchase → confirmation/receipt.
+function sendPurchaseEmail(to, planLabel) {
+    if (!to) return;
+    sendEmail(to, 'Your Renonym purchase is confirmed',
+        `<p style="color:#f0f0f8;font-size:16px;line-height:1.6;">Payment received — thank you! 🎉</p>
+<p style="color:rgba(255,255,255,0.7);font-size:14px;line-height:1.6;">Your <strong style="color:#c4b5fd">${htmlEsc(planLabel)}</strong> is now active on your account. Everything's unlocked and ready whenever you are.</p>
+${emailCta('Open Renonym →', APP_WEB + '/dashboard')}`);
+}
+
+// Job moved to "offer" → celebration + the give-5/get-5 referral ask.
+function sendOfferEmail(to, company, referralCode) {
+    if (!to) return;
+    const co = htmlEsc(company || 'them');
+    const ref = referralCode
+        ? `<p style="color:rgba(255,255,255,0.7);font-size:14px;line-height:1.6;margin-top:18px;">Know someone still searching? Your link gives them <strong style="color:#c4b5fd">5 free credits</strong> — and you get 5 too when they join:</p>
+${emailCta('Share Renonym — give 5, get 5', APP_WEB + '/?ref=' + encodeURIComponent(referralCode))}`
+        : '';
+    sendEmail(to, '🎉 You landed an offer!',
+        `<p style="color:#f0f0f8;font-size:18px;line-height:1.5;">Congratulations on the offer from <strong>${co}</strong>!</p>
+<p style="color:rgba(255,255,255,0.7);font-size:14px;line-height:1.6;">You put in the work and it paid off. We're genuinely thrilled for you.</p>${ref}`);
+}
+
+// "You still have credits" nudge — sent once to accounts that have held credits
+// for 7+ days and never spent one. Claim-then-send so it can't double-fire.
+function maybeIdleNudge(u) {
+    if (!db || !mailer || !u || !u.email) return;
+    if (!(u.credit_balance > 0) || u.idle_nudge_sent_at) return;
+    setImmediate(async () => {
+        try {
+            const ok = await db.query(
+                `SELECT 1 FROM rn_users WHERE id=$1
+                   AND credit_balance > 0 AND idle_nudge_sent_at IS NULL
+                   AND created_at <= NOW() - INTERVAL '7 days'
+                   AND NOT EXISTS (SELECT 1 FROM rn_credit_ledger WHERE user_id=$1 AND delta < 0)`,
+                [u.id]);
+            if (!ok.rows.length) return;
+            const claim = await db.query(
+                'UPDATE rn_users SET idle_nudge_sent_at=NOW() WHERE id=$1 AND idle_nudge_sent_at IS NULL', [u.id]);
+            if (!claim.rowCount) return;   // someone else stamped it first
+            sendEmail(u.email, `You still have ${u.credit_balance} AI credits on Renonym`,
+                `<p style="color:#f0f0f8;font-size:16px;line-height:1.6;">Your credits are waiting ⚡</p>
+<p style="color:rgba(255,255,255,0.7);font-size:14px;line-height:1.6;">You've got <strong style="color:#c4b5fd">${u.credit_balance} unused AI credit${u.credit_balance === 1 ? '' : 's'}</strong>. Put them to work — tailor your résumé to a live job posting or run an AI review to see exactly what recruiters skip over.</p>
+${emailCta('Use my credits →', APP_WEB + '/builder')}`);
+        } catch (e) { console.error('[email] idle nudge failed:', e.message); }
     });
 }
 
@@ -2086,7 +2178,7 @@ app.get('/auth/google/callback', async (req, res) => {
             name: profile.name || profile.email.split('@')[0],
             provider: 'google', providerUserId: profile.sub,
             avatarUrl: profile.picture, anonClientId });
-        if (user.created) await grantSignupCredits(user.id);
+        if (user.created) { await grantSignupCredits(user.id); sendWelcomeEmail(user); }
         const token = signToken(user);
         const safeUser = { id:user.id, email:user.email, name:user.name, avatarUrl:user.avatar_url, plan:user.plan||'free' };
         // Store in polling map so LWC can pick it up
@@ -2143,7 +2235,7 @@ app.get('/auth/linkedin/callback', async (req, res) => {
 
         const user  = await upsertUser({ email, name: fullName, provider: 'linkedin',
             providerUserId: profile.sub, avatarUrl: profile.picture || null, anonClientId });
-        if (user.created) await grantSignupCredits(user.id);
+        if (user.created) { await grantSignupCredits(user.id); sendWelcomeEmail(user); }
         const token = signToken(user);
         console.log('[AUTH] LinkedIn login:', user.email);
         res.send(authSuccessPage(token, user));
@@ -2221,7 +2313,7 @@ app.get('/auth/magic-link/verify', async (req, res) => {
         const user  = await upsertUser({ email: link.email,
             name: link.email.split('@')[0], provider: 'email',
             providerUserId: null, avatarUrl: null, anonClientId: link.client_id });
-        if (user.created) await grantSignupCredits(user.id);
+        if (user.created) { await grantSignupCredits(user.id); sendWelcomeEmail(user); }
         const jwtToken = signToken(user);
         const safeUser = { id:user.id, email:user.email, name:user.name, avatarUrl:user.avatar_url, plan:user.plan||'free' };
         // Set unconditionally (not just if pre-registered) so a server restart
@@ -2256,6 +2348,8 @@ app.get('/auth/me', requireAuth, async (req, res) => {
         }
         await expireStaleCredits(u.id);
         const fresh = await db.query('SELECT credit_balance FROM rn_users WHERE id=$1', [u.id]).catch(() => null);
+        if (fresh && fresh.rows.length) u.credit_balance = fresh.rows[0].credit_balance;
+        maybeIdleNudge(u);   // fire-and-forget: nudge accounts sitting on unused credits
         res.json({ id:u.id, email:u.email, name:u.name, avatarUrl:u.avatar_url,
             plan:u.plan, resumeCount:u.resume_count, atsCount:u.ats_reports_count,
             createdAt:u.created_at, lastLoginAt:u.last_login_at,
@@ -2557,11 +2651,11 @@ app.post('/verify-payment', async (req, res) => {
         // Resolve the user to grant to. Prefer the signed-in JWT (always sent by
         // the client) over the body userId, which can be missing/stale — that was
         // causing Coach entitlement to silently not save after payment.
-        let grantUserId = null;
+        let grantUserId = null, grantEmail = null;
         try {
             const ah = req.headers['authorization'] || '';
             const tk = ah.startsWith('Bearer ') ? ah.slice(7) : null;
-            if (tk) grantUserId = jwt.verify(tk, JWT_SECRET).id;
+            if (tk) { const dec = jwt.verify(tk, JWT_SECRET); grantUserId = dec.id; grantEmail = dec.email; }
         } catch (e) { /* ignore bad/expired token */ }
         if (!grantUserId) grantUserId = userId;
         const coach = plan.coach; // 'unlimited' | 'pass' | undefined
@@ -2684,6 +2778,13 @@ app.post('/verify-payment', async (req, res) => {
         if (redeemed && db && (grantInfo.error || grantInfo.rows === 0)) {
             await db.query('DELETE FROM rn_payments WHERE payment_id=$1', [razorpay_payment_id]).catch(() => {});
             console.warn(`[${SERVER_VERSION}] redemption released for ${razorpay_payment_id} (grant did not land)`);
+        } else if (redeemed && db && grantInfo.rows > 0 && !grantInfo.error) {
+            // Fresh, successful grant → email the receipt (fire-and-forget).
+            if (grantEmail) sendPurchaseEmail(grantEmail, plan.label);
+            else setImmediate(async () => {
+                try { const r = await db.query('SELECT email FROM rn_users WHERE id=$1', [grantUserId]);
+                      if (r.rows[0] && r.rows[0].email) sendPurchaseEmail(r.rows[0].email, plan.label); } catch (_) {}
+            });
         }
 
         res.json({
@@ -3339,6 +3440,16 @@ app.patch('/tracker/jobs/:id', requireAuth, async (req, res) => {
                 [req.params.id, req.user.id, `Moved to "${stage}"`]).catch(() => {});
         }
         if (b.jd !== undefined) logJdCorpus(req.user.id, b.jd, 'tracker-edit');
+        // Job reached "offer" → celebration + referral email (fully off the response path).
+        if (stageProvided && stage === 'offer') {
+            const offered = r.rows[0];
+            setImmediate(async () => {
+                try {
+                    const ur = await db.query('SELECT email, referral_code FROM rn_users WHERE id=$1', [req.user.id]);
+                    if (ur.rows[0]) sendOfferEmail(ur.rows[0].email, offered.company, ur.rows[0].referral_code);
+                } catch (e) { console.error('[email] offer lookup failed:', e.message); }
+            });
+        }
         res.json(r.rows[0]);
     } catch (e) { console.error('[tracker] patch error:', e.message); res.status(500).json({ error: 'Failed to update the job.' }); }
 });
