@@ -76,11 +76,17 @@ app.use(
 );
 
 // --- Version marker ---------------------------------------------------------
-const SERVER_VERSION = 'v14.4-credits-2026';
+const SERVER_VERSION = 'v14.5-sec-2026';
 const BOOT_TIME      = Date.now();
 
 // --- Auth config ------------------------------------------------------------
-const JWT_SECRET     = process.env.JWT_SECRET     || 'CHANGE_ME_32_CHAR_RANDOM_SECRET';
+// Fail CLOSED: a missing/weak JWT secret must crash the boot, never silently
+// fall back to a public default (which would let anyone forge any session).
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET || JWT_SECRET.length < 32) {
+    console.error('FATAL: JWT_SECRET is missing or shorter than 32 chars. Refusing to start.');
+    process.exit(1);
+}
 const JWT_EXPIRES    = '30d';
 const FRONTEND_URL   = process.env.FRONTEND_URL   || 'https://developwithrax-dev-ed.my.site.com';
 const APP_URL        = process.env.APP_URL         || 'https://salesforce-resume-pdf-server-production.up.railway.app';
@@ -596,6 +602,9 @@ app.use('/improve-summary',     requirePremiumAuth, requireCredits(1));   // was
 app.use('/optimize-for-job',    requirePremiumAuth, requireCredits(1));   // was reachable anonymously — closed
 app.use('/analyze-job-match',   optionalAuth);   // anonymous gets a teaser; signed-in gets the full report
 app.use('/generate-pdf',        requirePremiumAuth, requireTemplateEntitlement);
+// Vision (gpt-4o) is the most expensive call in the app — never anonymous.
+// Login + 1 credit, same as the other output-producing AI actions.
+app.use('/analyze-food',        requirePremiumAuth, requireCredits(1));
 
 // Payment endpoints - rate limited + session validated
 app.use('/create-order',        paymentLimiter);
@@ -940,6 +949,30 @@ app.post('/generate-pdf', async (req, res) => {
         });
 
         const page = await browser.newPage();
+
+        // SECURITY — the rendered HTML/CSS is fully attacker-controlled (it is the
+        // client's resume preview). Treat it as hostile:
+        //  1. No scripting in the page. A resume PDF never needs JS; this neutralises
+        //     XSS/exfil vectors and removes the driver needed to chain a Chromium RCE.
+        //     (page.evaluate below still works — it runs over the DevTools protocol,
+        //     which setJavaScriptEnabled(false) does not disable. Verified.)
+        await page.setJavaScriptEnabled(false);
+        //  2. SSRF guard: block every outbound fetch the page tries except data:/about:
+        //     and an allowlist of HTTPS font hosts. Without this, <img src>, CSS url()
+        //     and @import could reach Railway-internal services / cloud metadata.
+        await page.setRequestInterception(true);
+        page.on('request', (r) => {
+            const url = r.url();
+            const type = r.resourceType();
+            if (url.startsWith('data:') || url.startsWith('about:') || url.startsWith('blob:')) return r.continue();
+            let host = '';
+            try { const u = new URL(url); if (u.protocol !== 'https:') return r.abort(); host = u.hostname; }
+            catch (_) { return r.abort(); }
+            const fontOk = (host === 'fonts.googleapis.com' || host === 'fonts.gstatic.com')
+                && (type === 'stylesheet' || type === 'font');
+            return fontOk ? r.continue() : r.abort();
+        });
+
         // No deviceScaleFactor - causes coordinate issues with getBoundingClientRect
         // Use a tall enough viewport so nothing is virtualized off-screen
         await page.setViewport({ width: 794, height: 2000, deviceScaleFactor: 1 });
@@ -948,6 +981,7 @@ app.post('/generate-pdf', async (req, res) => {
 <html>
 <head>
     <meta charset="UTF-8">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data: https://fonts.gstatic.com; style-src 'unsafe-inline' https://fonts.googleapis.com; font-src data: https://fonts.gstatic.com; script-src 'none'">
     <meta name="server-version" content="${SERVER_VERSION}">
     <style>
         /* Client CSS */
@@ -1120,6 +1154,7 @@ ${text}`;
                 { role: 'user',   content: prompt }
             ],
             temperature:     0.1,
+            max_tokens:      4000,   // bound output cost; headroom for a dense multi-page resume's JSON
             response_format: { type: 'json_object' }
         });
 
@@ -1729,6 +1764,7 @@ Return ONLY this JSON (no markdown fences):
                 { role: 'user',   content: userPrompt   }
             ],
             temperature:     0.2,
+            max_tokens:      1500,   // bound output cost / prompt-injection blast radius
             response_format: { type: 'json_object' }
         });
 
@@ -1837,6 +1873,7 @@ Return ONLY this JSON:
                 { role: 'user',   content: userPrompt   }
             ],
             temperature:     0.35,
+            max_tokens:      1500,   // bound output cost / prompt-injection blast radius
             response_format: { type: 'json_object' }
         });
 
@@ -1963,11 +2000,33 @@ setTimeout(function(){try{window.close();}catch(e){}},3000);
 </script></body></html>`.replace(/FRONTEND/g, FRONTEND_URL);
 }
 
+// --- OAuth state integrity --------------------------------------------------
+// The `state` round-trips through the user agent, so it must be tamper-proof:
+// sign it (HMAC-SHA256) and enforce a freshness window on the callback. This
+// stops an attacker from injecting a forged `cid` (which drives anonymous-data
+// migration) or replaying a stale state.
+function signState(obj) {
+    const payload = Buffer.from(JSON.stringify(obj)).toString('base64url');
+    const mac     = crypto.createHmac('sha256', JWT_SECRET).update(payload).digest('base64url');
+    return payload + '.' + mac;
+}
+function verifyState(state) {
+    if (!state || typeof state !== 'string' || state.indexOf('.') < 0) return null;
+    const i = state.indexOf('.');
+    const payload = state.slice(0, i), mac = state.slice(i + 1);
+    const expect  = crypto.createHmac('sha256', JWT_SECRET).update(payload).digest('base64url');
+    const a = Buffer.from(mac), b = Buffer.from(expect);
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+    let obj; try { obj = JSON.parse(Buffer.from(payload, 'base64url').toString()); } catch (_) { return null; }
+    if (!obj || !obj.ts || Date.now() - obj.ts > 10 * 60 * 1000) return null;   // 10-min window
+    return obj;
+}
+
 // --- Google OAuth -----------------------------------------------------------
 
 app.get('/auth/google', (req, res) => {
     if (!GOOGLE_ID) return res.send(authErrorPage('Google OAuth not configured on server.'));
-    const state  = Buffer.from(JSON.stringify({ cid: req.query.cid || '', nonce: req.query.nonce || '', ts: Date.now() })).toString('base64url');
+    const state  = signState({ cid: req.query.cid || '', nonce: req.query.nonce || '', ts: Date.now() });
     const params = new URLSearchParams({
         client_id: GOOGLE_ID,
         redirect_uri: APP_URL + '/auth/google/callback',
@@ -1981,8 +2040,9 @@ app.get('/auth/google/callback', async (req, res) => {
     if (!dbRequired(res)) return;
     const { code, state, error } = req.query;
     if (error || !code) return res.send(authErrorPage('Google sign-in was cancelled.'));
-    let anonClientId = '', stateData = {};
-    try { stateData = JSON.parse(Buffer.from(state||'','base64url').toString()); anonClientId = stateData.cid || ''; } catch(_){}
+    const stateData = verifyState(state);
+    if (!stateData) return res.send(authErrorPage('Sign-in link expired or was tampered with. Please try again.'));
+    const anonClientId = stateData.cid || '';
     try {
         const tokRes = await fetch('https://oauth2.googleapis.com/token', {
             method: 'POST',
@@ -2021,7 +2081,7 @@ app.get('/auth/google/callback', async (req, res) => {
 
 app.get('/auth/linkedin', (req, res) => {
     if (!LINKEDIN_ID) return res.send(authErrorPage('LinkedIn OAuth not configured on server.'));
-    const state  = Buffer.from(JSON.stringify({ cid: req.query.cid || '', nonce: req.query.nonce || '', ts: Date.now() })).toString('base64url');
+    const state  = signState({ cid: req.query.cid || '', nonce: req.query.nonce || '', ts: Date.now() });
     const params = new URLSearchParams({
         response_type: 'code', client_id: LINKEDIN_ID,
         redirect_uri: APP_URL + '/auth/linkedin/callback',
@@ -2034,8 +2094,9 @@ app.get('/auth/linkedin/callback', async (req, res) => {
     if (!dbRequired(res)) return;
     const { code, state, error } = req.query;
     if (error || !code) return res.send(authErrorPage('LinkedIn sign-in was cancelled.'));
-    let anonClientId = '', stateData = {};
-    try { stateData = JSON.parse(Buffer.from(state||'','base64url').toString()); anonClientId = stateData.cid || ''; } catch(_){}
+    const stateData = verifyState(state);
+    if (!stateData) return res.send(authErrorPage('Sign-in link expired or was tampered with. Please try again.'));
+    const anonClientId = stateData.cid || '';
     try {
         const tokRes = await fetch('https://www.linkedin.com/oauth/v2/accessToken', {
             method: 'POST',
@@ -2432,22 +2493,27 @@ app.post('/verify-payment', async (req, res) => {
             return res.status(400).json({ error: 'Missing payment fields' });
         }
 
-        // HMAC-SHA256(order_id + "|" + payment_id, KEY_SECRET)
+        // HMAC-SHA256(order_id + "|" + payment_id, KEY_SECRET), compared in
+        // constant time so the check can't be probed by timing.
         const body      = razorpay_order_id + '|' + razorpay_payment_id;
         const expected  = crypto
             .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
             .update(body)
             .digest('hex');
-
-        if (expected !== razorpay_signature) {
+        const expBuf = Buffer.from(expected, 'hex');
+        const sigBuf = Buffer.from(String(razorpay_signature || ''), 'hex');
+        const sigOk  = expBuf.length === sigBuf.length && crypto.timingSafeEqual(expBuf, sigBuf);
+        if (!sigOk) {
             console.warn(`[${SERVER_VERSION}] Signature mismatch for order ${razorpay_order_id}`);
             return res.status(400).json({ error: 'Invalid payment signature' });
         }
 
-        // The plan is derived from the ORDER (created server-side with the real
-        // amount), never from the client body — a ₹599 payment can't claim
-        // coach_unlimited by sending a different planId.
-        let effectivePlanId = planId;
+        // The plan is derived from the ORDER ONLY (created server-side with the
+        // real amount), NEVER from the client body — a ₹299 payment must not be
+        // able to claim pro_2999. If we can't read the order's plan, FAIL CLOSED
+        // rather than trusting the client: the payment is captured and idempotent,
+        // so a retry grants correctly without double-charging.
+        let effectivePlanId = null;
         try {
             const order = await razorpay.orders.fetch(razorpay_order_id);
             if (order && order.notes && order.notes.plan && PLANS[order.notes.plan]) {
@@ -2456,7 +2522,10 @@ app.post('/verify-payment', async (req, res) => {
                     console.warn(`[${SERVER_VERSION}] planId mismatch: body=${planId} order=${effectivePlanId} — using order`);
                 }
             }
-        } catch (e) { console.error(`[${SERVER_VERSION}] order fetch failed (using body planId):`, e.message); }
+        } catch (e) { console.error(`[${SERVER_VERSION}] order fetch failed:`, e.message); }
+        if (!effectivePlanId) {
+            return res.status(503).json({ error: 'Could not confirm your order yet. Your payment is safe — please retry in a moment; you will not be charged twice.' });
+        }
         const plan = PLANS[effectivePlanId];
         if (!plan) return res.status(400).json({ error: 'Unknown plan for this payment.' });
         console.log(`[${SERVER_VERSION}] Payment verified: order=${razorpay_order_id} payment=${razorpay_payment_id} plan=${effectivePlanId}`);
