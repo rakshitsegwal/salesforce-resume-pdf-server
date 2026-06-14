@@ -76,7 +76,7 @@ app.use(
 );
 
 // --- Version marker ---------------------------------------------------------
-const SERVER_VERSION = 'v14.6-lifecycle-2026';
+const SERVER_VERSION = 'v15.0-founding-2026';
 const BOOT_TIME      = Date.now();
 
 // --- Auth config ------------------------------------------------------------
@@ -278,6 +278,22 @@ if (process.env.DATABASE_URL) {
             tags       JSONB,
             created_at TIMESTAMPTZ DEFAULT NOW()
         );
+        -- Founding User Beta Program (first 20 verified redemptions).
+        ALTER TABLE rn_users ADD COLUMN IF NOT EXISTS email_verified         BOOLEAN     DEFAULT FALSE;
+        ALTER TABLE rn_users ADD COLUMN IF NOT EXISTS founding_user          BOOLEAN     DEFAULT FALSE;
+        ALTER TABLE rn_users ADD COLUMN IF NOT EXISTS founding_number        INTEGER;
+        ALTER TABLE rn_users ADD COLUMN IF NOT EXISTS trial_started_at       TIMESTAMPTZ;
+        ALTER TABLE rn_users ADD COLUMN IF NOT EXISTS trial_ends_at          TIMESTAMPTZ;
+        ALTER TABLE rn_users ADD COLUMN IF NOT EXISTS founding_discount_used BOOLEAN     DEFAULT FALSE;
+        -- Single-row atomic counter: the source of truth for "slots claimed".
+        -- All claims go through UPDATE ... WHERE claimed < cap, which row-locks
+        -- and serialises concurrent redemptions so the cap can NEVER be exceeded.
+        CREATE TABLE IF NOT EXISTS rn_founding_counter (
+            id      INTEGER PRIMARY KEY DEFAULT 1,
+            claimed INTEGER NOT NULL DEFAULT 0,
+            CONSTRAINT rn_founding_counter_single CHECK (id = 1)
+        );
+        INSERT INTO rn_founding_counter (id, claimed) VALUES (1, 0) ON CONFLICT (id) DO NOTHING;
     `)
     .then(() => console.log('[DB] Schema ready'))
     .catch(e => console.error('[DB] Schema init:', e.message));
@@ -2061,7 +2077,8 @@ function requireAuth(req, res, next) {
     catch (_) { res.status(401).json({ error: 'Session expired. Please log in again.', code: 'AUTH_REQUIRED' }); }
 }
 
-async function upsertUser({ email, name, provider, providerUserId, avatarUrl, anonClientId }) {
+async function upsertUser({ email, name, provider, providerUserId, avatarUrl, anonClientId, emailVerified }) {
+    const verified = !!emailVerified;   // Google email_verified, magic-link click, or LinkedIn-verified email
     const existing = await db.query(
         `SELECT * FROM rn_users WHERE (provider=$1 AND provider_user_id=$2) OR email=$3 LIMIT 1`,
         [provider, providerUserId || '', email]
@@ -2070,15 +2087,16 @@ async function upsertUser({ email, name, provider, providerUserId, avatarUrl, an
         const u = existing.rows[0];
         await db.query(
             `UPDATE rn_users SET name=$1, avatar_url=$2, last_login_at=NOW(),
+             email_verified = email_verified OR $5,
              anonymous_client_id=COALESCE(anonymous_client_id,$3) WHERE id=$4`,
-            [name || u.name, avatarUrl || u.avatar_url, anonClientId || null, u.id]
+            [name || u.name, avatarUrl || u.avatar_url, anonClientId || null, u.id, verified]
         );
-        return { ...u, name: name || u.name, avatar_url: avatarUrl || u.avatar_url };
+        return { ...u, name: name || u.name, avatar_url: avatarUrl || u.avatar_url, email_verified: u.email_verified || verified };
     }
     const r = await db.query(
-        `INSERT INTO rn_users(email,name,provider,provider_user_id,avatar_url,anonymous_client_id,referral_code)
-         VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
-        [email, name, provider, providerUserId || null, avatarUrl || null, anonClientId || null, makeReferralCode()]
+        `INSERT INTO rn_users(email,name,provider,provider_user_id,avatar_url,anonymous_client_id,referral_code,email_verified)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+        [email, name, provider, providerUserId || null, avatarUrl || null, anonClientId || null, makeReferralCode(), verified]
     );
     return { ...r.rows[0], created: true };   // brand-new account — Phase 5 signup grant keys off this
 }
@@ -2177,7 +2195,8 @@ app.get('/auth/google/callback', async (req, res) => {
         const user  = await upsertUser({ email: profile.email,
             name: profile.name || profile.email.split('@')[0],
             provider: 'google', providerUserId: profile.sub,
-            avatarUrl: profile.picture, anonClientId });
+            avatarUrl: profile.picture, anonClientId,
+            emailVerified: profile.email_verified === true || profile.email_verified === 'true' });
         if (user.created) { await grantSignupCredits(user.id); sendWelcomeEmail(user); }
         const token = signToken(user);
         const safeUser = { id:user.id, email:user.email, name:user.name, avatarUrl:user.avatar_url, plan:user.plan||'free' };
@@ -2234,7 +2253,8 @@ app.get('/auth/linkedin/callback', async (req, res) => {
         const email     = profile.email || profile.sub + '@linkedin.placeholder';
 
         const user  = await upsertUser({ email, name: fullName, provider: 'linkedin',
-            providerUserId: profile.sub, avatarUrl: profile.picture || null, anonClientId });
+            providerUserId: profile.sub, avatarUrl: profile.picture || null, anonClientId,
+            emailVerified: profile.email_verified === true || profile.email_verified === 'true' || !!email });
         if (user.created) { await grantSignupCredits(user.id); sendWelcomeEmail(user); }
         const token = signToken(user);
         console.log('[AUTH] LinkedIn login:', user.email);
@@ -2312,7 +2332,8 @@ app.get('/auth/magic-link/verify', async (req, res) => {
         await db.query('UPDATE rn_magic_tokens SET used_at=NOW() WHERE id=$1', [link.id]);
         const user  = await upsertUser({ email: link.email,
             name: link.email.split('@')[0], provider: 'email',
-            providerUserId: null, avatarUrl: null, anonClientId: link.client_id });
+            providerUserId: null, avatarUrl: null, anonClientId: link.client_id,
+            emailVerified: true });   // clicking the emailed link proves inbox control
         if (user.created) { await grantSignupCredits(user.id); sendWelcomeEmail(user); }
         const jwtToken = signToken(user);
         const safeUser = { id:user.id, email:user.email, name:user.name, avatarUrl:user.avatar_url, plan:user.plan||'free' };
@@ -2362,7 +2383,9 @@ app.get('/auth/me', requireAuth, async (req, res) => {
             interviewCredits: u.interview_credits || 0,
             freeInterviewUsed: !!u.free_interview_used,
             referralCode: u.referral_code || null,
-            grandfathered: !!u.grandfathered });
+            grandfathered: !!u.grandfathered,
+            emailVerified: !!u.email_verified,
+            founding: foundingView(u) });
     } catch (e) { res.status(500).json({ error: 'Failed to load profile.' }); }
 });
 
@@ -2569,26 +2592,49 @@ app.post('/create-order', async (req, res) => {
             return res.status(400).json({ error: 'Amount must be at least 100 paise' });
         }
 
+        // Founding 30%-off, first real purchase only (auto, server-decided). Detected
+        // here; the flag is only marked USED on a successful verify-payment, so an
+        // abandoned order doesn't burn it. Report-unlocks are excluded.
+        let amount = plan.amount;
+        let foundingDiscount = false;
+        if (db && planId !== 'report_unlock_299') {
+            let uid = null;
+            try {
+                const ah = req.headers['authorization'] || '';
+                const tk = ah.startsWith('Bearer ') ? ah.slice(7) : null;
+                if (tk) uid = jwt.verify(tk, JWT_SECRET).id;
+            } catch (e) {}
+            if (uid) {
+                const fr = await db.query('SELECT founding_user, founding_discount_used FROM rn_users WHERE id=$1', [uid]).catch(() => null);
+                if (fr && fr.rows[0] && fr.rows[0].founding_user && !fr.rows[0].founding_discount_used) {
+                    amount = Math.round(plan.amount * 0.7);   // 30% off
+                    foundingDiscount = true;
+                }
+            }
+        }
+
         const receipt = `rcpt_${planId}_${Date.now()}`;
 
         const order = await razorpay.orders.create({
-            amount:   plan.amount,
+            amount:   amount,
             currency: plan.currency,
             receipt:  receipt,
             notes: {
                 plan:      planId,
                 userId:    userId || 'guest',
+                foundingDiscount: foundingDiscount ? 'true' : '',
                 // report unlocks are bound to one interview session
                 sessionId: (planId === 'report_unlock_299' && req.body.sessionId && UUID_RE.test(String(req.body.sessionId))) ? String(req.body.sessionId) : ''
             }
         });
 
-        console.log(`[${SERVER_VERSION}] Razorpay order created: ${order.id} plan=${planId}`);
+        console.log(`[${SERVER_VERSION}] Razorpay order created: ${order.id} plan=${planId}${foundingDiscount ? ' (founding -30%)' : ''}`);
 
         res.json({
             order_id: order.id,
             amount:   order.amount,
             currency: order.currency,
+            foundingDiscount,
             key_id:   process.env.RAZORPAY_KEY_ID   // safe: public key only
         });
 
@@ -2631,11 +2677,12 @@ app.post('/verify-payment', async (req, res) => {
         // able to claim pro_2999. If we can't read the order's plan, FAIL CLOSED
         // rather than trusting the client: the payment is captured and idempotent,
         // so a retry grants correctly without double-charging.
-        let effectivePlanId = null;
+        let effectivePlanId = null, orderFoundingDiscount = false;
         try {
             const order = await razorpay.orders.fetch(razorpay_order_id);
             if (order && order.notes && order.notes.plan && PLANS[order.notes.plan]) {
                 effectivePlanId = order.notes.plan;
+                orderFoundingDiscount = order.notes.foundingDiscount === 'true';
                 if (planId && planId !== effectivePlanId) {
                     console.warn(`[${SERVER_VERSION}] planId mismatch: body=${planId} order=${effectivePlanId} — using order`);
                 }
@@ -2785,6 +2832,11 @@ app.post('/verify-payment', async (req, res) => {
                 try { const r = await db.query('SELECT email FROM rn_users WHERE id=$1', [grantUserId]);
                       if (r.rows[0] && r.rows[0].email) sendPurchaseEmail(r.rows[0].email, plan.label); } catch (_) {}
             });
+            // Founding 30%-off: mark used exactly once, only now that the discounted
+            // payment actually succeeded (atomic — a no-op if already marked).
+            if (orderFoundingDiscount && grantUserId) {
+                await db.query('UPDATE rn_users SET founding_discount_used=TRUE WHERE id=$1 AND founding_discount_used=FALSE', [grantUserId]).catch(() => {});
+            }
         }
 
         res.json({
@@ -3313,6 +3365,152 @@ app.post('/referral/claim', requireAuth, async (req, res) => {
     } catch (e) {
         console.error('[referral] claim error:', e.message);
         res.status(500).json({ error: 'Could not apply the referral.' });
+    }
+});
+
+// ============================================================================
+// FOUNDING USER BETA PROGRAM — first 20 verified NEW signups
+// ============================================================================
+// A coupon grants a 7-day full-premium trial (Placement-Pro-equivalent, FREE —
+// no Razorpay), capped at 20 redemptions via an ATOMIC counter. Founding users
+// then get 30% off their first real purchase (automatic, once). Every decision
+// (eligibility, cap, amount) is server-side; the client can only submit a code.
+const FOUNDING_CAP              = parseInt(process.env.FOUNDING_CAP || '20', 10);
+const FOUNDING_CODE             = (process.env.FOUNDING_CODE || 'FOUNDING20').trim().toUpperCase();
+const FOUNDING_TRIAL_DAYS       = parseInt(process.env.FOUNDING_TRIAL_DAYS || '7', 10);
+const FOUNDING_TRIAL_INTERVIEWS = parseInt(process.env.FOUNDING_TRIAL_INTERVIEWS || '25', 10);
+// Only accounts created on/after this instant may redeem (blocks existing users).
+const FOUNDING_PROGRAM_START    = process.env.FOUNDING_PROGRAM_START || '2026-06-14T00:00:00Z';
+const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || 'rakshit1352@gmail.com')
+    .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+
+function trialActive(u) {
+    return !!(u && u.trial_ends_at && new Date(u.trial_ends_at) > new Date());
+}
+// Founding surface for /auth/me + redeem responses.
+function foundingView(u) {
+    if (!u || !u.founding_user) return null;
+    const ends   = u.trial_ends_at ? new Date(u.trial_ends_at) : null;
+    const active = trialActive(u);
+    return {
+        number: u.founding_number || null,
+        trialStartedAt: u.trial_started_at,
+        trialEndsAt: u.trial_ends_at,
+        trialActive: active,
+        trialDaysRemaining: (active && ends) ? Math.max(0, Math.ceil((ends - Date.now()) / 86400000)) : 0,
+        discountUsed: !!u.founding_discount_used,
+        discountAvailable: !u.founding_discount_used,   // 30% off first real purchase
+    };
+}
+
+// Public slot counter — drives the landing-page "X / 20 left" banner.
+app.get('/founding/status', async (req, res) => {
+    try {
+        let claimed = 0;
+        if (db) {
+            const r = await db.query('SELECT claimed FROM rn_founding_counter WHERE id=1');
+            claimed = (r.rows[0] && r.rows[0].claimed) || 0;
+        }
+        const remaining = Math.max(0, FOUNDING_CAP - claimed);
+        res.json({ total: FOUNDING_CAP, claimed, remaining, open: remaining > 0 });
+    } catch (e) { res.json({ total: FOUNDING_CAP, claimed: FOUNDING_CAP, remaining: 0, open: false }); }
+});
+
+// Redeem the founding coupon → free 7-day premium trial (no payment gateway).
+app.use('/founding/redeem', validateApiSecret);
+app.use('/founding/redeem', rateLimit({ windowMs: 15 * 60 * 1000, max: 15, message: { error: 'Too many attempts — try again later.' } }));
+app.post('/founding/redeem', requireAuth, async (req, res) => {
+    if (!db) return res.status(503).json({ error: 'Not available.' });
+    try {
+        const code = String((req.body && req.body.code) || '').trim().toUpperCase();
+        if (code !== FOUNDING_CODE) return res.status(400).json({ error: 'That code isn’t valid.', code: 'BAD_CODE' });
+
+        const r = await db.query('SELECT * FROM rn_users WHERE id=$1', [req.user.id]);
+        if (!r.rows.length) return res.status(401).json({ error: 'Account not found.' });
+        const u = r.rows[0];
+
+        if (u.founding_user)   return res.json({ ok: true, already: true, founding: foundingView(u) });
+        if (!u.email_verified) return res.status(403).json({ error: 'Please verify your email first — sign in with Google or the email link.', code: 'NOT_VERIFIED' });
+        if (new Date(u.created_at) < new Date(FOUNDING_PROGRAM_START))
+            return res.status(403).json({ error: 'The founding program is for new accounts created during the beta.', code: 'NOT_ELIGIBLE' });
+
+        // Atomic slot claim — the row lock serialises concurrent redemptions, so
+        // the cap can NEVER be exceeded even under a stampede.
+        const slot = await db.query(
+            'UPDATE rn_founding_counter SET claimed = claimed + 1 WHERE id=1 AND claimed < $1 RETURNING claimed', [FOUNDING_CAP]);
+        if (!slot.rows.length) return res.status(409).json({ error: 'All founding spots are taken.', code: 'FULL' });
+        const number = slot.rows[0].claimed;
+
+        // Stamp the user (guarded). If a race already made them founding, give the slot back.
+        const stamp = await db.query(
+            `UPDATE rn_users SET
+                founding_user = TRUE, founding_number = $2,
+                trial_started_at = NOW(), trial_ends_at = NOW() + ($3 || ' days')::interval,
+                pass_type = 'placement', pass_expires_at = NOW() + ($3 || ' days')::interval,
+                pass_interviews_remaining = $4, updated_at = NOW()
+             WHERE id = $1 AND founding_user = FALSE
+             RETURNING founding_number, trial_started_at, trial_ends_at, founding_discount_used`,
+            [u.id, number, String(FOUNDING_TRIAL_DAYS), FOUNDING_TRIAL_INTERVIEWS]);
+        if (!stamp.rows.length) {
+            await db.query('UPDATE rn_founding_counter SET claimed = claimed - 1 WHERE id=1 AND claimed > 0');
+            return res.json({ ok: true, already: true });
+        }
+        console.log(`[${SERVER_VERSION}] founding redeemed: ${u.email} → #${number} (${FOUNDING_TRIAL_DAYS}-day trial)`);
+        res.json({ ok: true, founding: foundingView({ founding_user: true, ...stamp.rows[0] }) });
+    } catch (e) {
+        console.error('[founding] redeem error:', e.message);
+        res.status(500).json({ error: 'Could not redeem the code.' });
+    }
+});
+
+// Admin — founding program visibility + analytics. requireAuth + email allowlist.
+function requireAdmin(req, res, next) {
+    if (!req.user || !ADMIN_EMAILS.includes(String(req.user.email || '').toLowerCase()))
+        return res.status(403).json({ error: 'Forbidden.' });
+    next();
+}
+app.use('/admin', validateApiSecret);
+app.get('/admin/founding', requireAuth, requireAdmin, async (req, res) => {
+    if (!db) return res.status(503).json({ error: 'Not available.' });
+    try {
+        const c = await db.query('SELECT claimed FROM rn_founding_counter WHERE id=1');
+        const claimed = (c.rows[0] && c.rows[0].claimed) || 0;
+        // "Activated" = used a premium action during the trial. Founding users
+        // hold a PASS, so AI résumé actions bypass the credit ledger — interviews
+        // (the headline premium feature) are the reliable signal.
+        const users = await db.query(
+            `SELECT u.email, u.name, u.founding_number, u.email_verified,
+                    u.trial_started_at, u.trial_ends_at, u.founding_discount_used, u.created_at,
+                    (u.trial_ends_at > NOW()) AS trial_active,
+                    EXISTS(SELECT 1 FROM rn_payments p WHERE p.user_id = u.id) AS converted,
+                    (SELECT COUNT(*)::int FROM rn_interview_sessions s
+                       WHERE s.user_id = u.id
+                         AND s.created_at BETWEEN u.trial_started_at AND u.trial_ends_at) AS trial_actions
+             FROM rn_users u WHERE u.founding_user = TRUE ORDER BY u.founding_number ASC`);
+        const list = users.rows;
+        const pct = (n) => list.length ? Math.round(n / list.length * 100) : 0;
+        const feat = await db.query(
+            `SELECT COALESCE(s.interview_type,'interview') || ' · ' || COALESCE(s.mode,'text') AS reason,
+                    COUNT(*)::int AS n
+             FROM rn_interview_sessions s
+             JOIN rn_users u ON u.id = s.user_id AND u.founding_user = TRUE
+             WHERE s.created_at BETWEEN u.trial_started_at AND u.trial_ends_at
+             GROUP BY 1 ORDER BY n DESC LIMIT 10`);
+        res.json({
+            cap: FOUNDING_CAP, claimed, remaining: Math.max(0, FOUNDING_CAP - claimed),
+            analytics: {
+                signups: list.length,
+                verificationRate:       pct(list.filter(x => x.email_verified).length),
+                trialActivationRate:    pct(list.filter(x => x.trial_actions > 0).length),
+                conversionRate:         pct(list.filter(x => x.converted).length),
+                discountRedemptionRate: pct(list.filter(x => x.founding_discount_used).length),
+                topFeatures: feat.rows,
+            },
+            users: list,
+        });
+    } catch (e) {
+        console.error('[admin] founding error:', e.message);
+        res.status(500).json({ error: 'Failed to load founding data.' });
     }
 });
 
