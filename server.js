@@ -76,7 +76,7 @@ app.use(
 );
 
 // --- Version marker ---------------------------------------------------------
-const SERVER_VERSION = 'v15.0-founding-2026';
+const SERVER_VERSION = 'v15.1-paymentfix-2026';
 const BOOT_TIME      = Date.now();
 
 // --- Auth config ------------------------------------------------------------
@@ -2746,7 +2746,7 @@ app.post('/verify-payment', async (req, res) => {
                     const mk = await db.query(
                         `INSERT INTO rn_credit_ledger(user_id, delta, reason, ref_id, expires_at)
                          VALUES($1, $2, $3, $4, $5)
-                         ON CONFLICT (ref_id) WHERE reason LIKE 'purchase:%' DO NOTHING`,
+                         ON CONFLICT (ref_id) WHERE reason LIKE 'purchase:%' AND ref_id IS NOT NULL DO NOTHING`,
                         [grantUserId,
                          v14 === 'boost' ? 10 : 0,
                          'purchase:' + v14,
@@ -2839,12 +2839,20 @@ app.post('/verify-payment', async (req, res) => {
             }
         }
 
-        res.json({
-            success:    true,
+        // Be HONEST about the outcome: a captured payment whose grant didn't land
+        // must NOT report success — otherwise the customer is told it worked while
+        // getting nothing. The payment id is echoed so support can reconcile it.
+        const granted = !grantInfo.error && grantInfo.rows > 0;
+        if (!granted) {
+            console.error(`[${SERVER_VERSION}] GRANT NOT APPLIED for ${razorpay_payment_id} (user=${grantUserId}, plan=${effectivePlanId}, err=${grantInfo.error || 'rows=0'})`);
+        }
+        res.status(granted ? 200 : 502).json({
+            success:    granted,
             payment_id: razorpay_payment_id,
             order_id:   razorpay_order_id,
             plan:       effectivePlanId,
-            grant:      grantInfo
+            grant:      grantInfo,
+            ...(granted ? {} : { error: 'Payment received — activation hit a snag. Refresh in a few seconds; if it’s still not applied, contact support with this payment id and you’ll be credited.' })
         });
 
     } catch (err) {
