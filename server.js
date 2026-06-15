@@ -76,7 +76,7 @@ app.use(
 );
 
 // --- Version marker ---------------------------------------------------------
-const SERVER_VERSION = 'v15.2-analytics-2026';
+const SERVER_VERSION = 'v15.3-jdcap-2026';
 const BOOT_TIME      = Date.now();
 
 // --- Auth config ------------------------------------------------------------
@@ -1823,11 +1823,11 @@ app.post('/analyze-job-match', async (req, res) => {
         if (!jobDescription || jobDescription.trim().length < 30) {
             return res.status(400).json({ error: 'Job description is too short (minimum 30 characters).' });
         }
-        if (jobDescription.length > 6000) {
-            return res.status(400).json({ error: 'Job description is too long. Please paste a maximum of 6000 characters.' });
+        if (jobDescription.length > 20000) {
+            return res.status(400).json({ error: 'Job description is too long — paste the relevant part (under 20,000 characters).' });
         }
-        if (resumeText && resumeText.length > 10000) {
-            return res.status(400).json({ error: 'Resume text is too long. Maximum 10000 characters accepted.' });
+        if (resumeText && resumeText.length > 20000) {
+            return res.status(400).json({ error: 'Resume text is too long. Maximum 20,000 characters accepted.' });
         }
 
         const resumeString = buildResumeString(resumeData, resumeText);
@@ -1948,11 +1948,11 @@ app.post('/optimize-for-job', async (req, res) => {
         if (!jobDescription || jobDescription.trim().length < 30) {
             return res.status(400).json({ error: 'Job description is too short (minimum 30 characters).' });
         }
-        if (jobDescription.length > 6000) {
-            return res.status(400).json({ error: 'Job description is too long. Maximum 6000 characters accepted.' });
+        if (jobDescription.length > 20000) {
+            return res.status(400).json({ error: 'Job description is too long — paste the relevant part (under 20,000 characters).' });
         }
-        if (resumeText && resumeText.length > 10000) {
-            return res.status(400).json({ error: 'Resume text is too long. Maximum 10000 characters accepted.' });
+        if (resumeText && resumeText.length > 20000) {
+            return res.status(400).json({ error: 'Resume text is too long. Maximum 20,000 characters accepted.' });
         }
 
         const resumeString = buildResumeString(resumeData, resumeText);
