@@ -76,7 +76,7 @@ app.use(
 );
 
 // --- Version marker ---------------------------------------------------------
-const SERVER_VERSION = 'v15.1-paymentfix-2026';
+const SERVER_VERSION = 'v15.2-analytics-2026';
 const BOOT_TIME      = Date.now();
 
 // --- Auth config ------------------------------------------------------------
@@ -2199,7 +2199,7 @@ app.get('/auth/google/callback', async (req, res) => {
             emailVerified: profile.email_verified === true || profile.email_verified === 'true' });
         if (user.created) { await grantSignupCredits(user.id); sendWelcomeEmail(user); }
         const token = signToken(user);
-        const safeUser = { id:user.id, email:user.email, name:user.name, avatarUrl:user.avatar_url, plan:user.plan||'free' };
+        const safeUser = { id:user.id, email:user.email, name:user.name, avatarUrl:user.avatar_url, plan:user.plan||'free', created: !!user.created };
         // Store in polling map so LWC can pick it up
         if (stateData && stateData.nonce && pendingAuthSessions.has(stateData.nonce)) {
             pendingAuthSessions.set(stateData.nonce, { token, user: safeUser, createdAt: Date.now() });
@@ -2336,7 +2336,7 @@ app.get('/auth/magic-link/verify', async (req, res) => {
             emailVerified: true });   // clicking the emailed link proves inbox control
         if (user.created) { await grantSignupCredits(user.id); sendWelcomeEmail(user); }
         const jwtToken = signToken(user);
-        const safeUser = { id:user.id, email:user.email, name:user.name, avatarUrl:user.avatar_url, plan:user.plan||'free' };
+        const safeUser = { id:user.id, email:user.email, name:user.name, avatarUrl:user.avatar_url, plan:user.plan||'free', created: !!user.created };
         // Set unconditionally (not just if pre-registered) so a server restart
         // between request and click doesn't strand the sign-in.
         if (link.client_id) {
