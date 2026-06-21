@@ -76,7 +76,7 @@ app.use(
 );
 
 // --- Version marker ---------------------------------------------------------
-const SERVER_VERSION = 'v15.3-jdcap-2026';
+const SERVER_VERSION = 'v15.4-promo-2026';
 const BOOT_TIME      = Date.now();
 
 // --- Auth config ------------------------------------------------------------
@@ -2554,6 +2554,25 @@ const PLANS = {
     session_pass:           { amount: 59900,   label: 'Coach Session Pass',   currency: 'INR', coach: 'pass', retired: true }
 };
 
+// Reusable promo code (e.g. for Meta ad campaigns). A flat percent off any
+// paid plan except report-unlock. Configurable via env; defaults to a working
+// launch code so it's live immediately. The discount is computed server-side.
+const PROMO_CODE    = (process.env.PROMO_CODE || 'RENONYM50').trim().toUpperCase();
+const PROMO_PERCENT = Math.max(0, Math.min(90, parseInt(process.env.PROMO_PERCENT || '50', 10)));
+function promoDiscount(planId, couponRaw) {
+    const code = String(couponRaw || '').trim().toUpperCase();
+    if (!code || !PROMO_CODE || code !== PROMO_CODE || planId === 'report_unlock_299') return null;
+    return { code: PROMO_CODE, percent: PROMO_PERCENT };
+}
+
+// Validate a promo code (client uses this to show the discounted price).
+app.use('/promo/validate', validateApiSecret);
+app.get('/promo/validate', (req, res) => {
+    const ok = promoDiscount('boost_299', req.query.code);   // any non-report plan
+    if (ok) return res.json({ valid: true, code: ok.code, percent: ok.percent });
+    res.json({ valid: false });
+});
+
 // POST /create-order
 // Creates a Razorpay order server-side - key_secret never leaves the server
 app.post('/create-order', async (req, res) => {
@@ -2592,26 +2611,11 @@ app.post('/create-order', async (req, res) => {
             return res.status(400).json({ error: 'Amount must be at least 100 paise' });
         }
 
-        // Founding 30%-off, first real purchase only (auto, server-decided). Detected
-        // here; the flag is only marked USED on a successful verify-payment, so an
-        // abandoned order doesn't burn it. Report-unlocks are excluded.
+        // Promo coupon — flat % off, server-computed amount. The client can only
+        // submit a code; it can never set the price.
         let amount = plan.amount;
-        let foundingDiscount = false;
-        if (db && planId !== 'report_unlock_299') {
-            let uid = null;
-            try {
-                const ah = req.headers['authorization'] || '';
-                const tk = ah.startsWith('Bearer ') ? ah.slice(7) : null;
-                if (tk) uid = jwt.verify(tk, JWT_SECRET).id;
-            } catch (e) {}
-            if (uid) {
-                const fr = await db.query('SELECT founding_user, founding_discount_used FROM rn_users WHERE id=$1', [uid]).catch(() => null);
-                if (fr && fr.rows[0] && fr.rows[0].founding_user && !fr.rows[0].founding_discount_used) {
-                    amount = Math.round(plan.amount * 0.7);   // 30% off
-                    foundingDiscount = true;
-                }
-            }
-        }
+        const promo = promoDiscount(planId, req.body && req.body.coupon);
+        if (promo) amount = Math.round(plan.amount * (100 - promo.percent) / 100);
 
         const receipt = `rcpt_${planId}_${Date.now()}`;
 
@@ -2622,19 +2626,19 @@ app.post('/create-order', async (req, res) => {
             notes: {
                 plan:      planId,
                 userId:    userId || 'guest',
-                foundingDiscount: foundingDiscount ? 'true' : '',
+                promo:     promo ? promo.code : '',
                 // report unlocks are bound to one interview session
                 sessionId: (planId === 'report_unlock_299' && req.body.sessionId && UUID_RE.test(String(req.body.sessionId))) ? String(req.body.sessionId) : ''
             }
         });
 
-        console.log(`[${SERVER_VERSION}] Razorpay order created: ${order.id} plan=${planId}${foundingDiscount ? ' (founding -30%)' : ''}`);
+        console.log(`[${SERVER_VERSION}] Razorpay order created: ${order.id} plan=${planId}${promo ? ` (promo ${promo.code} -${promo.percent}%)` : ''}`);
 
         res.json({
             order_id: order.id,
             amount:   order.amount,
             currency: order.currency,
-            foundingDiscount,
+            promoApplied: promo ? promo.percent : 0,
             key_id:   process.env.RAZORPAY_KEY_ID   // safe: public key only
         });
 
@@ -3413,21 +3417,18 @@ function foundingView(u) {
 
 // Public slot counter — drives the landing-page "X / 20 left" banner.
 app.get('/founding/status', async (req, res) => {
-    try {
-        let claimed = 0;
-        if (db) {
-            const r = await db.query('SELECT claimed FROM rn_founding_counter WHERE id=1');
-            claimed = (r.rows[0] && r.rows[0].claimed) || 0;
-        }
-        const remaining = Math.max(0, FOUNDING_CAP - claimed);
-        res.json({ total: FOUNDING_CAP, claimed, remaining, open: remaining > 0 });
-    } catch (e) { res.json({ total: FOUNDING_CAP, claimed: FOUNDING_CAP, remaining: 0, open: false }); }
+    // Program ended — always closed so any cached client hides the banner.
+    res.json({ total: FOUNDING_CAP, claimed: FOUNDING_CAP, remaining: 0, open: false });
 });
 
 // Redeem the founding coupon → free 7-day premium trial (no payment gateway).
 app.use('/founding/redeem', validateApiSecret);
 app.use('/founding/redeem', rateLimit({ windowMs: 15 * 60 * 1000, max: 15, message: { error: 'Too many attempts — try again later.' } }));
 app.post('/founding/redeem', requireAuth, async (req, res) => {
+    // Founding program ended — code retired. (Endpoint kept so old clients get a
+    // clean message instead of a 404.)
+    return res.status(410).json({ error: 'The founding program has ended.', code: 'ENDED' });
+    /* eslint-disable no-unreachable */
     if (!db) return res.status(503).json({ error: 'Not available.' });
     try {
         const code = String((req.body && req.body.code) || '').trim().toUpperCase();
