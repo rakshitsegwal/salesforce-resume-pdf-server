@@ -76,7 +76,7 @@ app.use(
 );
 
 // --- Version marker ---------------------------------------------------------
-const SERVER_VERSION = 'v15.4-promo-2026';
+const SERVER_VERSION = 'v16-reprice-2026';
 const BOOT_TIME      = Date.now();
 
 // --- Auth config ------------------------------------------------------------
@@ -2537,12 +2537,17 @@ If no food visible: {"error":"No food detected."}` }
 // ============================================================================
 
 const PLANS = {
-    // ── v14 credit + pass ladder (one-time orders; amounts live HERE only) ──
+    // ── credit + pass ladder (one-time orders; amounts live HERE only) ──
+    // Reprice 2026-06 (aggressive India ladder): ₹49 tripwire single · ₹199
+    // Prep Pack · ₹699 hero Season · ₹1,499 decoy Placement. Keys keep their
+    // ORIGINAL names for reference-safety across the app — the only price of
+    // record is `amount` (paise). The ₹299 report-unlock SKU is retired: the
+    // free first interview now returns the full report (see reportIsLocked).
     boost_299:         { amount: 29900,  label: 'Boost Pack — 10 credits',      currency: 'INR', grant: 'boost' },
-    single_499:        { amount: 49900,  label: 'Single Interview',             currency: 'INR', grant: 'single' },
-    season_1499:       { amount: 149900, label: 'Season Pass — 90 days',        currency: 'INR', grant: 'season' },
-    pro_2999:          { amount: 299900, label: 'Placement Pro — 90 days',      currency: 'INR', grant: 'placement' },
-    report_unlock_299: { amount: 29900,  label: 'Full Report Unlock',           currency: 'INR', grant: 'report_unlock' },
+    single_499:        { amount: 4900,   label: 'Single Interview',             currency: 'INR', grant: 'single' },
+    prep_199:          { amount: 19900,  label: 'Prep Pack — 3 interviews',     currency: 'INR', grant: 'prep' },
+    season_1499:       { amount: 69900,  label: 'Season Pass — 90 days',        currency: 'INR', grant: 'season' },
+    pro_2999:          { amount: 149900, label: 'Placement Pro — 90 days',      currency: 'INR', grant: 'placement' },
     // ── retired SKUs: no longer purchasable; kept so historical verify-payment
     //    replays and refund lookups stay safe ──
     pro_monthly:  { amount: 59900,  label: 'Pro Monthly',  currency: 'INR', retired: true },
@@ -2561,7 +2566,7 @@ const PROMO_CODE    = (process.env.PROMO_CODE || 'RENONYM50').trim().toUpperCase
 const PROMO_PERCENT = Math.max(0, Math.min(90, parseInt(process.env.PROMO_PERCENT || '50', 10)));
 function promoDiscount(planId, couponRaw) {
     const code = String(couponRaw || '').trim().toUpperCase();
-    if (!code || !PROMO_CODE || code !== PROMO_CODE || planId === 'report_unlock_299') return null;
+    if (!code || !PROMO_CODE || code !== PROMO_CODE) return null;
     return { code: PROMO_CODE, percent: PROMO_PERCENT };
 }
 
@@ -2588,25 +2593,6 @@ app.post('/create-order', async (req, res) => {
         if (plan.retired && process.env.LADDER_LIVE === 'true') {
             return res.status(400).json({ error: 'This plan is no longer available — see the new plans.' });
         }
-        // report unlocks are bound to ONE owned, still-locked free session —
-        // reject up front so ₹299 can never be captured with nothing to grant
-        if (planId === 'report_unlock_299') {
-            let uid = null;
-            try {
-                const ah = req.headers['authorization'] || '';
-                const tk = ah.startsWith('Bearer ') ? ah.slice(7) : null;
-                if (tk) uid = jwt.verify(tk, JWT_SECRET).id;
-            } catch (e) {}
-            const sid = String(req.body.sessionId || '');
-            if (!uid) return res.status(401).json({ error: 'Sign in to unlock your report.', code: 'AUTH_REQUIRED' });
-            if (!UUID_RE.test(sid)) return res.status(400).json({ error: 'Missing interview session for this unlock.' });
-            if (db) {
-                const chk = await db.query(
-                    `SELECT id FROM rn_interview_sessions
-                     WHERE id=$1 AND user_id=$2 AND is_free_session=TRUE AND report_unlocked=FALSE`, [sid, uid]);
-                if (!chk.rows.length) return res.status(400).json({ error: 'That report is already unlocked (or the session was not found).' });
-            }
-        }
         if (plan.amount < 100) {
             return res.status(400).json({ error: 'Amount must be at least 100 paise' });
         }
@@ -2627,8 +2613,7 @@ app.post('/create-order', async (req, res) => {
                 plan:      planId,
                 userId:    userId || 'guest',
                 promo:     promo ? promo.code : '',
-                // report unlocks are bound to one interview session
-                sessionId: (planId === 'report_unlock_299' && req.body.sessionId && UUID_RE.test(String(req.body.sessionId))) ? String(req.body.sessionId) : ''
+                sessionId: ''
             }
         });
 
@@ -2773,10 +2758,12 @@ app.post('/verify-payment', async (req, res) => {
                     // buying ANY interview product unlocks a previously locked free report
                     await db.query(`UPDATE rn_interview_sessions SET report_unlocked=TRUE WHERE user_id=$1 AND is_free_session=TRUE`, [grantUserId]).catch(() => {});
                     console.log(`[${SERVER_VERSION}] Single Interview granted (fresh=${v14Fresh})`);
-                } else if (v14 === 'season' || v14 === 'placement') {
-                    const passExp = new Date(Date.now() + 90 * 24 * 60 * 60 * 1000);
-                    const interviews = v14 === 'season' ? 6 : 25;
-                    const passType = v14 === 'season' ? 'season' : 'placement_pro';
+                } else if (v14 === 'season' || v14 === 'placement' || v14 === 'prep') {
+                    // prep = a 30-day mini-pass (3 interviews); season/placement are 90-day.
+                    const passCfg = { season: { days: 90, n: 8, type: 'season' }, placement: { days: 90, n: 25, type: 'placement_pro' }, prep: { days: 30, n: 3, type: 'prep' } }[v14];
+                    const passExp = new Date(Date.now() + passCfg.days * 24 * 60 * 60 * 1000);
+                    const interviews = passCfg.n;
+                    const passType = passCfg.type;
                     if (v14Fresh) {
                         const r = await db.query(
                             `UPDATE rn_users SET pass_type=$2, pass_expires_at=$3,
@@ -2950,7 +2937,10 @@ function partialReport(r) {
     };
 }
 function reportIsLocked(row) {
-    return !!(row && row.is_free_session && !row.report_unlocked);
+    // Reprice 2026-06: the free first interview now returns the FULL report
+    // (the ₹299 unlock SKU is retired). Nothing is ever locked — this also
+    // un-blurs any free reports that were created while locking was active.
+    return false;
 }
 
 function coachAccess(u) {
@@ -3146,7 +3136,7 @@ app.post('/coach/sessions', requireAuth, aiLimiter, async (req, res) => {
                 `INSERT INTO rn_interview_sessions(user_id,company,job_title,job_description,interview_type,difficulty,mode,resume_snapshot,questions,status,is_free_session,report_unlocked)
                  VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'in_progress',$10,$11) RETURNING id, questions`,
                 [req.user.id, String(company || '').slice(0, 255), String(jobTitle || '').slice(0, 255), jobDescription, type, diff, mode === 'text' ? 'text' : 'voice', resumeData || null, JSON.stringify(questions),
-                 isFreeSession, !isFreeSession]
+                 isFreeSession, true]   /* report_unlocked: free reports are now full (reprice 2026-06) */
             );
         } catch (insErr) {
             // refund whatever we just consumed — the user got nothing
