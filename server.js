@@ -76,7 +76,7 @@ app.use(
 );
 
 // --- Version marker ---------------------------------------------------------
-const SERVER_VERSION = 'v17-otp-auth-2026';
+const SERVER_VERSION = 'v18-otp-http-2026';
 const BOOT_TIME      = Date.now();
 
 // --- Auth config ------------------------------------------------------------
@@ -304,12 +304,31 @@ if (process.env.DATABASE_URL) {
 }
 
 // --- Email transporter ------------------------------------------------------
+// Prefer Resend's HTTP API over SMTP: Railway (like most PaaS) blocks outbound
+// SMTP ports (465/587), so nodemailer's SMTP send to smtp.resend.com just HANGS.
+// The HTTP API goes over 443 and always works. We expose a `sendMail()` shim so
+// every existing caller (OTP, magic-link, welcome) keeps working unchanged.
 let mailer = null;
 if (process.env.RESEND_API_KEY) {
-    mailer = nodemailer.createTransport({
-        host: 'smtp.resend.com', port: 465, secure: true,
-        auth: { user: 'resend', pass: process.env.RESEND_API_KEY }
-    });
+    mailer = {
+        async sendMail({ from, to, subject, html, text }) {
+            const ctrl = new AbortController();
+            const t = setTimeout(() => ctrl.abort(), 12000);   // never hang a request
+            try {
+                const r = await fetch('https://api.resend.com/emails', {
+                    method: 'POST',
+                    headers: { 'Authorization': `Bearer ${process.env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ from, to: Array.isArray(to) ? to : [to], subject, html, text }),
+                    signal: ctrl.signal,
+                });
+                if (!r.ok) {
+                    const body = await r.text().catch(() => '');
+                    throw new Error(`Resend ${r.status}: ${body.slice(0, 300)}`);
+                }
+                return await r.json().catch(() => ({}));
+            } finally { clearTimeout(t); }
+        }
+    };
 } else if (process.env.SMTP_HOST) {
     mailer = nodemailer.createTransport({
         host: process.env.SMTP_HOST,
