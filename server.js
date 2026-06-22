@@ -76,7 +76,7 @@ app.use(
 );
 
 // --- Version marker ---------------------------------------------------------
-const SERVER_VERSION = 'v18b-otp-debug-2026';
+const SERVER_VERSION = 'v19-otp-2026';
 const BOOT_TIME      = Date.now();
 
 // --- Auth config ------------------------------------------------------------
@@ -2477,7 +2477,7 @@ app.post('/auth/email/request-otp', async (req, res) => {
     } catch (e) {
         console.error('[AUTH] OTP request error:', e.message);
         logSignup('otp_request_error', req, { reason: e.message });
-        res.status(500).json({ error: 'Could not send your code. Please try again.', detail: String(e.message || '').slice(0, 300) /* TEMP diagnostic — remove */ });
+        res.status(500).json({ error: 'Could not send your code. Please try again.' });
     }
 });
 
