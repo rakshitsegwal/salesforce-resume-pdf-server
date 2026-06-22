@@ -76,7 +76,7 @@ app.use(
 );
 
 // --- Version marker ---------------------------------------------------------
-const SERVER_VERSION = 'v16-reprice-2026';
+const SERVER_VERSION = 'v17-otp-auth-2026';
 const BOOT_TIME      = Date.now();
 
 // --- Auth config ------------------------------------------------------------
@@ -270,6 +270,8 @@ if (process.env.DATABASE_URL) {
         -- Free first interview produces a PARTIAL report until unlocked.
         ALTER TABLE rn_interview_sessions ADD COLUMN IF NOT EXISTS is_free_session BOOLEAN DEFAULT FALSE;
         ALTER TABLE rn_interview_sessions ADD COLUMN IF NOT EXISTS report_unlocked BOOLEAN DEFAULT TRUE;
+        -- Email-OTP sign-in: per-code brute-force guard (attempts on the active code row).
+        ALTER TABLE rn_magic_tokens ADD COLUMN IF NOT EXISTS attempts INT DEFAULT 0;
         -- JD corpus for future programmatic SEO (fire-and-forget writes only).
         CREATE TABLE IF NOT EXISTS rn_jd_corpus (
             id         UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -459,9 +461,17 @@ const paymentLimiter = rateLimit({
 // Magic link - strict to prevent email spam abuse
 const magicLinkLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,   // 15 minutes
-    max: 5,                      // 5 magic link requests per IP per 15 min
+    max: 5,                      // 5 magic link / OTP requests per IP per 15 min
     standardHeaders: true,
     message: { error: 'Too many email requests. Please wait 15 minutes.' }
+});
+
+// Email-OTP verification — cap guesses per IP (per-code attempts also capped on the row).
+const otpVerifyLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 30,
+    standardHeaders: true,
+    message: { error: 'Too many attempts. Please wait 15 minutes.' }
 });
 
 // Auth polling - light limit to prevent nonce enumeration
@@ -743,8 +753,10 @@ app.use('/create-order',        validateClientSession);
 app.use('/verify-payment',      paymentLimiter);
 app.use('/verify-payment',      validateClientSession);
 
-// Magic link - rate limited to prevent email spam
+// Magic link / email OTP - rate limited to prevent email spam
 app.use('/auth/magic-link/request', magicLinkLimiter);
+app.use('/auth/email/request-otp',  magicLinkLimiter);
+app.use('/auth/email/verify-otp',   otpVerifyLimiter);
 
 // Auth polling - light rate limit
 app.use('/auth/poll',           pollLimiter);
@@ -2078,7 +2090,17 @@ function requireAuth(req, res, next) {
 }
 
 async function upsertUser({ email, name, provider, providerUserId, avatarUrl, anonClientId, emailVerified }) {
-    const verified = !!emailVerified;   // Google email_verified, magic-link click, or LinkedIn-verified email
+    const verified = !!emailVerified;   // Google email_verified, magic-link click, LinkedIn- or OTP-verified email
+    // INTENTIONAL: match by provider identity OR by email. `rn_users.email` is
+    // UNIQUE NOT NULL — email IS the account identity, so the same address across
+    // providers (Google ↔ email-OTP) is deliberately ONE account. Every caller
+    // here passes a verified email (Google/LinkedIn-verified, or proven via the
+    // emailed OTP/magic-link), so this is account *consolidation*, not takeover:
+    // signing in via OTP requires receiving the code, i.e. controlling the inbox —
+    // the same control that could reset a Google password anyway. Do NOT add
+    // `AND email_verified=true` here: an existing unverified-email row would then
+    // miss this lookup and fall through to an INSERT that violates the UNIQUE
+    // email constraint, hard-failing that user's sign-in.
     const existing = await db.query(
         `SELECT * FROM rn_users WHERE (provider=$1 AND provider_user_id=$2) OR email=$3 LIMIT 1`,
         [provider, providerUserId || '', email]
@@ -2347,6 +2369,151 @@ app.get('/auth/magic-link/verify', async (req, res) => {
     } catch (e) {
         console.error('[AUTH] Magic link verify error:', e.message);
         res.send(authErrorPage('Sign-in failed. Please try again.'));
+    }
+});
+
+// ── Email OTP sign-in (the webview-safe path) ───────────────────────────────
+// In-app browsers (Instagram/FB/TikTok/LinkedIn) block window.open popups AND
+// Google blocks OAuth in embedded webviews — so the ONLY reliable signup there
+// is: email a 6-digit code, user types it back into the SAME view. No popup,
+// no third-party cookie, no polling. Returns the JWT directly on success.
+function hashOtp(email, code) {
+    return crypto.createHash('sha256').update(String(email).toLowerCase() + ':' + String(code)).digest('hex');
+}
+function maskEmail(e) {
+    const [u, d] = String(e || '').split('@');
+    if (!d) return '***';
+    return (u.length <= 2 ? (u[0] || '*') : u.slice(0, 2)) + '***@' + d;
+}
+// Phase-1 signup logging — one structured line per attempt/failure (grep
+// "[SIGNUP]" in Railway logs). Phase 2 will make this queryable.
+function logSignup(event, req, extra = {}) {
+    try {
+        console.log('[SIGNUP] ' + JSON.stringify({
+            event,
+            ua: String(req.headers['user-agent'] || '').slice(0, 180),
+            ip: req.headers['x-forwarded-for'] || req.ip || '',
+            ...extra,
+        }));
+    } catch (_) { /* never let logging break auth */ }
+}
+// Per-EMAIL request ceiling (independent of IP). The per-IP limiter + per-code
+// 5-attempt cap don't bound an attacker who rotates IPs to mint unlimited fresh
+// codes (each resetting attempts) for one target inbox. Cap codes/email/window
+// so total guesses stay ~ (cap × 5). In-memory is fine: a restart only loosens
+// it briefly, and the per-IP limiter + per-code cap still apply.
+const OTP_EMAIL_MAX = 3;                      // codes per email per window
+const OTP_EMAIL_WINDOW_MS = 15 * 60 * 1000;
+const otpEmailHits = new Map();               // email -> [timestamps]
+function otpEmailAllowed(email, now) {
+    const arr = (otpEmailHits.get(email) || []).filter(t => now - t < OTP_EMAIL_WINDOW_MS);
+    if (arr.length >= OTP_EMAIL_MAX) { otpEmailHits.set(email, arr); return false; }
+    arr.push(now);
+    otpEmailHits.set(email, arr);
+    if (otpEmailHits.size > 5000) {           // crude memory bound
+        for (const [k, v] of otpEmailHits) { if (!v.some(t => now - t < OTP_EMAIL_WINDOW_MS)) otpEmailHits.delete(k); }
+    }
+    return true;
+}
+
+app.post('/auth/email/request-otp', async (req, res) => {
+    if (!dbRequired(res)) return;
+    const email = String((req.body && req.body.email) || '').trim().toLowerCase();
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        logSignup('otp_request_invalid_email', req);
+        return res.status(400).json({ error: 'Please enter a valid email address.' });
+    }
+    if (!mailer) {
+        logSignup('otp_request_no_mailer', req, { email: maskEmail(email) });
+        return res.status(503).json({ error: 'Email sign-in isn’t enabled yet — please use Google, or try again shortly.' });
+    }
+    if (!otpEmailAllowed(email, Date.now())) {
+        logSignup('otp_request_email_capped', req, { email: maskEmail(email) });
+        return res.status(429).json({ error: 'Too many codes requested for this email. Please wait a few minutes.' });
+    }
+    try {
+        const code      = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+        const codeHash  = hashOtp(email, code);
+        const expiresAt = new Date(Date.now() + 10 * 60 * 1000);   // 10-minute code
+        // one active code per email (OTP rows are tagged client_id='otp')
+        await db.query("DELETE FROM rn_magic_tokens WHERE email=$1 AND client_id='otp' AND used_at IS NULL", [email]);
+        await db.query(
+            "INSERT INTO rn_magic_tokens(email, token, expires_at, client_id, attempts) VALUES($1,$2,$3,'otp',0)",
+            [email, codeHash, expiresAt]
+        );
+        await mailer.sendMail({
+            from: process.env.SMTP_FROM || 'noreply@renonym.ai',
+            to: email,
+            subject: `${code} is your Renonym sign-in code`,
+            html: `<div style="font-family:system-ui,sans-serif;max-width:420px;margin:0 auto;padding:28px 22px;background:#0b0c1a;border-radius:16px;color:#fff;text-align:center;">
+<div style="font-size:18px;font-weight:600;margin-bottom:6px;">Your Renonym sign-in code</div>
+<div style="color:rgba(255,255,255,0.6);font-size:13px;margin-bottom:22px;">Enter this code in the app to sign in.</div>
+<div style="font-size:38px;font-weight:800;letter-spacing:10px;color:#E8C994;">${code}</div>
+<div style="color:rgba(255,255,255,0.4);font-size:12px;margin-top:22px;">This code expires in 10 minutes. If you didn’t request it, you can ignore this email.</div>
+</div>`,
+            text: `Your Renonym sign-in code is ${code}. It expires in 10 minutes.`,
+        });
+        logSignup('otp_requested', req, { email: maskEmail(email) });
+        res.json({ ok: true });
+    } catch (e) {
+        console.error('[AUTH] OTP request error:', e.message);
+        logSignup('otp_request_error', req, { reason: e.message });
+        res.status(500).json({ error: 'Could not send your code. Please try again.' });
+    }
+});
+
+app.post('/auth/email/verify-otp', async (req, res) => {
+    if (!dbRequired(res)) return;
+    const email    = String((req.body && req.body.email) || '').trim().toLowerCase();
+    const code     = String((req.body && req.body.code) || '').trim();
+    const clientId = (req.body && req.body.clientId) || null;
+    if (!email || !/^\d{6}$/.test(code)) {
+        return res.status(400).json({ error: 'Enter the 6-digit code from your email.' });
+    }
+    try {
+        const r = await db.query(
+            `SELECT * FROM rn_magic_tokens
+             WHERE email=$1 AND client_id='otp' AND used_at IS NULL AND expires_at>NOW()
+             ORDER BY created_at DESC LIMIT 1`, [email]);
+        if (!r.rows.length) {
+            // Same wording as a wrong code below — don't reveal whether a pending
+            // code exists for this email (avoids light enumeration).
+            logSignup('otp_verify_no_code', req, { email: maskEmail(email) });
+            return res.status(400).json({ error: 'Incorrect or expired code — check the latest email, or request a new one.' });
+        }
+        const row = r.rows[0];
+        if ((row.attempts || 0) >= 5) {
+            await db.query('UPDATE rn_magic_tokens SET used_at=NOW() WHERE id=$1', [row.id]);
+            logSignup('otp_verify_locked', req, { email: maskEmail(email) });
+            return res.status(429).json({ error: 'Too many wrong tries. Request a new code.' });
+        }
+        // constant-time compare on the hashes
+        const expected = Buffer.from(row.token, 'hex');
+        const provided = Buffer.from(hashOtp(email, code), 'hex');
+        const ok = expected.length === provided.length && crypto.timingSafeEqual(expected, provided);
+        if (!ok) {
+            await db.query('UPDATE rn_magic_tokens SET attempts=attempts+1 WHERE id=$1', [row.id]);
+            logSignup('otp_verify_wrong', req, { email: maskEmail(email), attempts: (row.attempts || 0) + 1 });
+            return res.status(400).json({ error: 'Incorrect or expired code — check the latest email, or request a new one.' });
+        }
+        // Atomically claim the code: only ONE concurrent verify can flip used_at,
+        // so a race can't sign in twice off the same code.
+        const claim = await db.query('UPDATE rn_magic_tokens SET used_at=NOW() WHERE id=$1 AND used_at IS NULL RETURNING id', [row.id]);
+        if (!claim.rows.length) {
+            logSignup('otp_verify_race', req, { email: maskEmail(email) });
+            return res.status(400).json({ error: 'That code was just used. Request a new one.' });
+        }
+        const user = await upsertUser({ email, name: email.split('@')[0], provider: 'email',
+            providerUserId: null, avatarUrl: null, anonClientId: clientId, emailVerified: true });
+        if (user.created) { await grantSignupCredits(user.id); sendWelcomeEmail(user); }
+        const jwtToken = signToken(user);
+        const safeUser = { id:user.id, email:user.email, name:user.name, avatarUrl:user.avatar_url, plan:user.plan||'free', created: !!user.created };
+        logSignup(user.created ? 'signup_succeeded' : 'login_succeeded', req, { email: maskEmail(email), method: 'otp' });
+        res.json({ token: jwtToken, user: safeUser });
+    } catch (e) {
+        console.error('[AUTH] OTP verify error:', e.message);
+        logSignup('otp_verify_error', req, { reason: e.message });
+        res.status(500).json({ error: 'Sign-in failed. Please try again.' });
     }
 });
 
