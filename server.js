@@ -76,7 +76,7 @@ app.use(
 );
 
 // --- Version marker ---------------------------------------------------------
-const SERVER_VERSION = 'v20-demo-2026';
+const SERVER_VERSION = 'v21-leads-2026';
 const BOOT_TIME      = Date.now();
 
 // --- Auth config ------------------------------------------------------------
@@ -161,6 +161,18 @@ if (process.env.DATABASE_URL) {
             created_at TIMESTAMPTZ  DEFAULT NOW()
         );
         CREATE INDEX IF NOT EXISTS idx_rn_magic_token ON rn_magic_tokens(token);
+
+        -- Demo email-capture leads (value-before-signup funnel). One row per
+        -- email; payload keeps the demo scorecard for follow-up/retargeting.
+        CREATE TABLE IF NOT EXISTS rn_leads (
+            id         UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+            email      VARCHAR(255) NOT NULL,
+            source     VARCHAR(40)  DEFAULT 'demo',
+            payload    JSONB,
+            created_at TIMESTAMPTZ  DEFAULT NOW(),
+            last_seen_at TIMESTAMPTZ DEFAULT NOW(),
+            UNIQUE(email, source)
+        );
 
         -- ── Interview Coach ──────────────────────────────────────────────
         -- Coach entitlement is separate from the résumé 'plan' (free/pro):
@@ -572,6 +584,8 @@ app.use('/create-order',        validateApiSecret);
 app.use('/verify-payment',      validateApiSecret);
 app.use('/demo/feedback',       validateApiSecret);   // public demo: secret only (no JWT)
 app.use('/demo/feedback',       demoLimiter);
+app.use('/demo/email-report',   validateApiSecret);
+app.use('/demo/email-report',   magicLinkLimiter);    // it sends an email — cap per IP
 
 // IP-based rate limits
 app.use('/generate-template',   aiLimiter);
@@ -2592,6 +2606,55 @@ Return ONLY JSON: {"communication":int,"confidence":int,"specificity":int,"verdi
     } catch (e) {
         console.error('[demo] feedback error:', e.message);
         res.status(500).json({ error: 'Could not score that answer right now. Please try again.' });
+    }
+});
+
+// POST /demo/email-report — capture email AFTER the demo value + send the
+// scorecard to the inbox. NO account required (the in-app-browser-safe path:
+// they get value by email even if they never finish signup). Stored as a lead.
+app.post('/demo/email-report', async (req, res) => {
+    const email = String((req.body && req.body.email) || '').trim().toLowerCase();
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        return res.status(400).json({ error: 'Please enter a valid email address.' });
+    }
+    if (!mailer) return res.status(503).json({ error: 'Email isn’t enabled yet — tap “Start now” to continue in the app.' });
+    const clamp = (n) => Math.max(0, Math.min(100, Math.round(Number(n) || 0)));
+    const s = (req.body && req.body.scores) || {};
+    const scores = { communication: clamp(s.communication), confidence: clamp(s.confidence), specificity: clamp(s.specificity), overall: clamp(s.overall) };
+    const verdict = String((req.body && req.body.verdict) || '').slice(0, 160);
+    const notes   = (Array.isArray(req.body && req.body.notes) ? req.body.notes : []).slice(0, 2).map(n => String(n).slice(0, 280));
+    try {
+        if (db) {
+            await db.query(
+                `INSERT INTO rn_leads(email, source, payload) VALUES($1,'demo',$2)
+                 ON CONFLICT (email, source) DO UPDATE SET payload=$2, last_seen_at=NOW()`,
+                [email, JSON.stringify({ scores, verdict, notes })]
+            ).catch(e => console.error('[demo] lead upsert failed:', e.message));
+        }
+        const start = 'https://renonym.com/coach/new';
+        const row = (k, v) => `<tr><td style="padding:6px 0;color:#9296A0;font-size:13px;">${k}</td><td style="padding:6px 0;text-align:right;font-weight:700;color:#E8C994;font-size:13px;">${v}</td></tr>`;
+        await mailer.sendMail({
+            from: process.env.SMTP_FROM || 'noreply@renonym.com',
+            to: email,
+            subject: `Your interview scorecard — ${scores.overall}/100`,
+            html: `<div style="font-family:system-ui,sans-serif;max-width:460px;margin:0 auto;padding:28px 22px;background:#0b0c1a;border-radius:16px;color:#fff;">
+<div style="font-size:18px;font-weight:600;margin-bottom:4px;">Your practice scorecard</div>
+<div style="color:rgba(255,255,255,0.6);font-size:13px;margin-bottom:18px;">${verdict || 'Here’s how your answer scored.'}</div>
+<div style="font-size:40px;font-weight:800;color:#E8C994;">${scores.overall}<span style="font-size:16px;color:rgba(255,255,255,0.5);">/100</span></div>
+<table style="width:100%;margin:16px 0;border-collapse:collapse;">
+${row('Communication', scores.communication)}${row('Confidence', scores.confidence)}${row('Specificity', scores.specificity)}
+</table>
+${notes.length ? `<div style="font-size:13px;color:#C7C9CD;line-height:1.6;margin-bottom:18px;"><b style="color:#fff;">What to fix:</b><br>${notes.map(n => '• ' + n).join('<br>')}</div>` : ''}
+<a href="${start}" style="display:block;text-align:center;background:linear-gradient(168deg,#E8C994,#D4AF73);color:#1A1305;text-decoration:none;font-weight:700;padding:13px;border-radius:10px;">Start your full free mock interview →</a>
+<div style="color:rgba(255,255,255,0.4);font-size:12px;margin-top:16px;text-align:center;">Your first full interview is free — voice or text, with a complete report.</div>
+</div>`,
+            text: `Your interview scorecard: ${scores.overall}/100. Communication ${scores.communication}, Confidence ${scores.confidence}, Specificity ${scores.specificity}. ${verdict}\n\nStart your full free mock interview: ${start}`,
+        });
+        console.log('[demo] report emailed + lead captured:', maskEmail(email));
+        res.json({ ok: true });
+    } catch (e) {
+        console.error('[demo] email-report error:', e.message);
+        res.status(500).json({ error: 'Could not send the email. Please try again, or tap “Start now”.' });
     }
 });
 
