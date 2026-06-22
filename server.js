@@ -76,7 +76,7 @@ app.use(
 );
 
 // --- Version marker ---------------------------------------------------------
-const SERVER_VERSION = 'v19-otp-2026';
+const SERVER_VERSION = 'v20-demo-2026';
 const BOOT_TIME      = Date.now();
 
 // --- Auth config ------------------------------------------------------------
@@ -462,6 +462,16 @@ const aiLimiter = rateLimit({
     message: { error: 'Too many AI requests. Please try again in 15 minutes.' }
 });
 
+// Public landing demo (one anonymous answer → scorecard). Tighter than aiLimiter
+// since it's unauthenticated; the handler also caps tokens + answer length.
+const demoLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 10,                     // 10 demo scores per IP per window
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'You’ve tried the demo a few times — sign up to keep going (it’s free).' }
+});
+
 const exportLimiter = rateLimit({
     windowMs: 60 * 60 * 1000,   // 1 hour
     max: 20,                     // per IP — generous for Pro users / shared NATs
@@ -560,6 +570,8 @@ app.use('/optimize-for-job',    validateApiSecret);
 app.use('/analyze-food',        validateApiSecret);
 app.use('/create-order',        validateApiSecret);
 app.use('/verify-payment',      validateApiSecret);
+app.use('/demo/feedback',       validateApiSecret);   // public demo: secret only (no JWT)
+app.use('/demo/feedback',       demoLimiter);
 
 // IP-based rate limits
 app.use('/generate-template',   aiLimiter);
@@ -2533,6 +2545,53 @@ app.post('/auth/email/verify-otp', async (req, res) => {
         console.error('[AUTH] OTP verify error:', e.message);
         logSignup('otp_verify_error', req, { reason: e.message });
         res.status(500).json({ error: 'Sign-in failed. Please try again.' });
+    }
+});
+
+// --- Landing demo (value before signup) -------------------------------------
+// One anonymous interview answer → a real scorecard. No auth, no DB. This is
+// the cold-traffic activation hook: the visitor experiences the product in
+// seconds. Cost-capped (cheap model, low tokens, answer truncated) + IP
+// rate-limited (demoLimiter). "Good enough for validation," not bulletproof.
+app.post('/demo/feedback', async (req, res) => {
+    const question = String((req.body && req.body.question) || '').slice(0, 400).trim();
+    const role     = String((req.body && req.body.role) || '').slice(0, 120).trim();
+    const answer   = String((req.body && req.body.answer) || '').slice(0, 1500).trim();   // cost cap
+    if (answer.length < 15) {
+        return res.status(400).json({ error: 'Add a couple of sentences so the coach has something to score.' });
+    }
+    try {
+        const system = `You are a sharp, encouraging mock-interview coach scoring ONE answer to ONE interview question.
+Score three dimensions 0-100:
+- communication: clarity, structure, easy to follow
+- confidence: conviction, ownership ("I did…"), no hedging
+- specificity: concrete details, real examples, numbers/impact
+Be realistic but motivating: a vague one-liner scores low (30-50); a structured answer with a concrete example and impact scores high (80+). Then write 1-2 SPECIFIC, actionable notes that quote or reference THEIR actual answer (not generic tips).
+Return ONLY JSON: {"communication":int,"confidence":int,"specificity":int,"verdict":string (max 12 words, encouraging),"notes":[string, ...] (1-2 items, each one concrete sentence)}.`;
+        const user = `Role: ${role || 'general / not specified'}\nQuestion: ${question || 'Tell me about a project you are proud of.'}\nCandidate answer: ${answer}`;
+        const completion = await openai.chat.completions.create({
+            model:           'gpt-4.1-mini',
+            messages:        [{ role: 'system', content: system }, { role: 'user', content: user }],
+            temperature:     0.3,
+            max_tokens:      350,
+            response_format: { type: 'json_object' },
+        });
+        let r;
+        try { r = JSON.parse(completion.choices[0].message.content); }
+        catch { return res.status(502).json({ error: 'Could not score that answer. Please try again.' }); }
+        const clamp = (n) => Math.max(0, Math.min(100, Math.round(Number(n) || 0)));
+        const out = {
+            communication: clamp(r.communication),
+            confidence:    clamp(r.confidence),
+            specificity:   clamp(r.specificity),
+            verdict:       String(r.verdict || 'Solid start — here’s how to sharpen it.').slice(0, 120),
+            notes:         (Array.isArray(r.notes) ? r.notes : []).slice(0, 2).map(n => String(n).slice(0, 280)),
+        };
+        out.overall = Math.round((out.communication + out.confidence + out.specificity) / 3);
+        res.json(out);
+    } catch (e) {
+        console.error('[demo] feedback error:', e.message);
+        res.status(500).json({ error: 'Could not score that answer right now. Please try again.' });
     }
 });
 
