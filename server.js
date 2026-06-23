@@ -76,7 +76,7 @@ app.use(
 );
 
 // --- Version marker ---------------------------------------------------------
-const SERVER_VERSION = 'v21-leads-2026';
+const SERVER_VERSION = 'v22-demoattempts-2026';
 const BOOT_TIME      = Date.now();
 
 // --- Auth config ------------------------------------------------------------
@@ -173,6 +173,20 @@ if (process.env.DATABASE_URL) {
             last_seen_at TIMESTAMPTZ DEFAULT NOW(),
             UNIQUE(email, source)
         );
+
+        -- Anonymous demo attempts (logged-out homepage trial). Kept by browser
+        -- client-id and linked to the account on signup so the pre-signup value
+        -- isn't orphaned.
+        CREATE TABLE IF NOT EXISTS rn_demo_attempts (
+            id         UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+            client_id  VARCHAR(100),
+            user_id    UUID,
+            question   TEXT,
+            answer     TEXT,
+            scores     JSONB,
+            created_at TIMESTAMPTZ  DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_rn_demo_attempts_client ON rn_demo_attempts(client_id);
 
         -- ── Interview Coach ──────────────────────────────────────────────
         -- Coach entitlement is separate from the résumé 'plan' (free/pro):
@@ -2134,6 +2148,14 @@ function requireAuth(req, res, next) {
     catch (_) { res.status(401).json({ error: 'Session expired. Please log in again.', code: 'AUTH_REQUIRED' }); }
 }
 
+// Link any anonymous demo attempts (kept by browser client-id) to the account
+// on signup/login, so the value created before signup isn't orphaned.
+function linkDemoAttempts(userId, clientId) {
+    if (!db || !userId || !clientId) return;
+    db.query('UPDATE rn_demo_attempts SET user_id=$1 WHERE client_id=$2 AND user_id IS NULL', [userId, clientId])
+      .catch(e => console.error('[demo] link attempts failed:', e.message));
+}
+
 async function upsertUser({ email, name, provider, providerUserId, avatarUrl, anonClientId, emailVerified }) {
     const verified = !!emailVerified;   // Google email_verified, magic-link click, LinkedIn- or OTP-verified email
     // INTENTIONAL: match by provider identity OR by email. `rn_users.email` is
@@ -2158,6 +2180,7 @@ async function upsertUser({ email, name, provider, providerUserId, avatarUrl, an
              anonymous_client_id=COALESCE(anonymous_client_id,$3) WHERE id=$4`,
             [name || u.name, avatarUrl || u.avatar_url, anonClientId || null, u.id, verified]
         );
+        linkDemoAttempts(u.id, anonClientId);
         return { ...u, name: name || u.name, avatar_url: avatarUrl || u.avatar_url, email_verified: u.email_verified || verified };
     }
     const r = await db.query(
@@ -2165,6 +2188,7 @@ async function upsertUser({ email, name, provider, providerUserId, avatarUrl, an
          VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
         [email, name, provider, providerUserId || null, avatarUrl || null, anonClientId || null, makeReferralCode(), verified]
     );
+    linkDemoAttempts(r.rows[0].id, anonClientId);
     return { ...r.rows[0], created: true };   // brand-new account — Phase 5 signup grant keys off this
 }
 
@@ -2603,6 +2627,14 @@ Return ONLY JSON: {"communication":int,"confidence":int,"specificity":int,"verdi
         };
         out.overall = Math.round((out.communication + out.confidence + out.specificity) / 3);
         res.json(out);
+        // Persist the anonymous attempt (fire-and-forget) so it can be linked to
+        // the account on signup — never blocks or fails the response.
+        const cid = String(req.headers['x-client-id'] || '').slice(0, 100);
+        if (db && cid) {
+            db.query('INSERT INTO rn_demo_attempts(client_id, question, answer, scores) VALUES($1,$2,$3,$4)',
+                [cid, (question || '').slice(0, 400), answer, JSON.stringify(out)])
+              .catch(e => console.error('[demo] attempt save failed:', e.message));
+        }
     } catch (e) {
         console.error('[demo] feedback error:', e.message);
         res.status(500).json({ error: 'Could not score that answer right now. Please try again.' });
