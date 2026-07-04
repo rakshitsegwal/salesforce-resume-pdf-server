@@ -2663,7 +2663,7 @@ app.post('/demo/email-report', async (req, res) => {
                 [email, JSON.stringify({ scores, verdict, notes })]
             ).catch(e => console.error('[demo] lead upsert failed:', e.message));
         }
-        const start = 'https://renonym.com/coach/new';
+        const start = APP_WEB + '/coach/new';   // env-driven — survives the app→app.renonym.com domain move
         const row = (k, v) => `<tr><td style="padding:6px 0;color:#9296A0;font-size:13px;">${k}</td><td style="padding:6px 0;text-align:right;font-weight:700;color:#E8C994;font-size:13px;">${v}</td></tr>`;
         await mailer.sendMail({
             from: process.env.SMTP_FROM || 'noreply@renonym.com',
